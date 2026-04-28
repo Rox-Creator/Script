@@ -94,11 +94,13 @@ local Stats = { TitansKilled = 0 }
 
 -- Lifetime / persistent stats. Lives in its own file so it survives
 -- config corruption / format changes. Updated in-memory on each event
--- (kill, refill, retry, uptime tick) and flushed to disk every 30s
--- by a background loop.
+-- (kill, retry, uptime tick) and flushed to disk every 30s by a
+-- background loop. EXP / Gold are read from the Rewards screen each
+-- time Auto Retry fires (slots 1_1 and 1_2 of the Items grid).
 local LifetimeStats = {
     titansKilled = 0,
-    refills      = 0,
+    exp          = 0,
+    gold         = 0,
     retries      = 0,
     uptime       = 0,    -- seconds with any kill mode active
 }
@@ -162,7 +164,8 @@ local function loadLifetimeStats()
     local okJ, data = pcall(function() return HttpService:JSONDecode(raw) end)
     if not (okJ and type(data) == "table") then return end
     if type(data.titansKilled) == "number" then LifetimeStats.titansKilled = data.titansKilled end
-    if type(data.refills)      == "number" then LifetimeStats.refills      = data.refills      end
+    if type(data.exp)          == "number" then LifetimeStats.exp          = data.exp          end
+    if type(data.gold)         == "number" then LifetimeStats.gold         = data.gold         end
     if type(data.retries)      == "number" then LifetimeStats.retries      = data.retries      end
     if type(data.uptime)       == "number" then LifetimeStats.uptime       = data.uptime       end
 end
@@ -510,6 +513,36 @@ local function getNearestRefill()
     return bestPart
 end
 
+-- Reads the Quantity TextLabel of a single rewards-screen item slot.
+-- Slots are named "<row>_<col>" — EXP is always 1_1, Gold always 1_2
+-- in AOT:R's mission-completed UI. Strips commas ("16,704" → 16704)
+-- and returns a number, or nil if the slot / label can't be read.
+local function getRewardItemQuantity(slotName)
+    local pg     = LocalPlayer:FindFirstChild("PlayerGui")
+    local iface  = pg     and pg:FindFirstChild("Interface")
+    local rew    = iface  and iface:FindFirstChild("Rewards")
+    local mainA  = rew    and rew:FindFirstChild("Main")
+    local info   = mainA  and mainA:FindFirstChild("Info")
+    local mainB  = info   and info:FindFirstChild("Main")
+    local items  = mainB  and mainB:FindFirstChild("Items")
+    local slot   = items  and items:FindFirstChild(slotName)
+    if not slot then return nil end
+
+    local descs
+    pcall(function() descs = slot:GetDescendants() end)
+    if not descs then return nil end
+    for _, d in ipairs(descs) do
+        local okN, name = pcall(function() return d.Name end)
+        if okN and name == "Quantity" then
+            local okT, txt = pcall(function() return d.Text end)
+            if okT and type(txt) == "string" then
+                return tonumber((txt:gsub(",", "")))
+            end
+        end
+    end
+    return nil
+end
+
 local function getOrCreateLine(idx)
     local ln = VisualizerLines[idx]
     if ln then return ln end
@@ -640,7 +673,8 @@ GUI.HitboxSizeVal    = nil
 GUI.KillsVal         = nil
 GUI.UptimeVal        = nil
 GUI.LifeKillsVal     = nil
-GUI.LifeRefillsVal   = nil
+GUI.LifeExpVal       = nil
+GUI.LifeGoldVal      = nil
 GUI.LifeRetriesVal   = nil
 GUI.LifeUptimeVal    = nil
 
@@ -864,7 +898,8 @@ ClearContent = function()
     GUI.KillsVal        = nil
     GUI.UptimeVal       = nil
     GUI.LifeKillsVal    = nil
-    GUI.LifeRefillsVal  = nil
+    GUI.LifeExpVal      = nil
+    GUI.LifeGoldVal     = nil
     GUI.LifeRetriesVal  = nil
     GUI.LifeUptimeVal   = nil
 end
@@ -1514,13 +1549,14 @@ local function PageAutomation(zb, cardX, cardW)
     -- AOTR/stats.json. Kept under the session Stats card so users can
     -- compare current vs. all-time at a glance.
     local lifeTopY = contentTopY + statsH + 14
-    local lifeH    = 52 + 4 * 30 + 10
+    local lifeH    = 52 + 5 * 30 + 10
     local lY = DrawCard(rightX, lifeTopY, colW, lifeH, "Lifetime", zb)
 
-    GUI.LifeKillsVal   = DrawStatRow(rightX, colW, lY,        "Titans Killed",  LifetimeStats.titansKilled, zb)
-    GUI.LifeRefillsVal = DrawStatRow(rightX, colW, lY + 30,   "Refills",        LifetimeStats.refills, zb)
-    GUI.LifeRetriesVal = DrawStatRow(rightX, colW, lY + 60,   "Retries",        LifetimeStats.retries, zb)
-    GUI.LifeUptimeVal  = DrawStatRow(rightX, colW, lY + 90,   "Total Uptime",   "00:00", zb)
+    GUI.LifeKillsVal   = DrawStatRow(rightX, colW, lY,        "Titans Killed", LifetimeStats.titansKilled, zb)
+    GUI.LifeExpVal     = DrawStatRow(rightX, colW, lY + 30,   "EXP Gained",    LifetimeStats.exp, zb)
+    GUI.LifeGoldVal    = DrawStatRow(rightX, colW, lY + 60,   "Gold Gained",   LifetimeStats.gold, zb)
+    GUI.LifeRetriesVal = DrawStatRow(rightX, colW, lY + 90,   "Retries",       LifetimeStats.retries, zb)
+    GUI.LifeUptimeVal  = DrawStatRow(rightX, colW, lY + 120,  "Total Uptime",  "00:00", zb)
 end
 
 
@@ -1642,6 +1678,18 @@ local function FormatUptime(seconds)
     return string.format("%02d:%02d", m, s)
 end
 
+-- Format integers with comma thousands separators ("1234567" → "1,234,567").
+local function commaFmt(n)
+    n = math.floor(n)
+    local s = tostring(n)
+    while true do
+        local replaced
+        s, replaced = s:gsub("^(-?%d+)(%d%d%d)", "%1,%2")
+        if replaced == 0 then break end
+    end
+    return s
+end
+
 local function getTitanCount()
     local count = 0
     local titansFolder = Workspace:FindFirstChild("Titans")
@@ -1675,17 +1723,22 @@ local function UpdateStatsLive()
             GUI.UptimeVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.UptimeVal.Position.Y)
         end
         if GUI.LifeKillsVal then
-            local txt = tostring(LifetimeStats.titansKilled)
+            local txt = commaFmt(LifetimeStats.titansKilled)
             GUI.LifeKillsVal.Text = txt
             GUI.LifeKillsVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.LifeKillsVal.Position.Y)
         end
-        if GUI.LifeRefillsVal then
-            local txt = tostring(LifetimeStats.refills)
-            GUI.LifeRefillsVal.Text = txt
-            GUI.LifeRefillsVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.LifeRefillsVal.Position.Y)
+        if GUI.LifeExpVal then
+            local txt = commaFmt(LifetimeStats.exp)
+            GUI.LifeExpVal.Text = txt
+            GUI.LifeExpVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.LifeExpVal.Position.Y)
+        end
+        if GUI.LifeGoldVal then
+            local txt = commaFmt(LifetimeStats.gold)
+            GUI.LifeGoldVal.Text = txt
+            GUI.LifeGoldVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.LifeGoldVal.Position.Y)
         end
         if GUI.LifeRetriesVal then
-            local txt = tostring(LifetimeStats.retries)
+            local txt = commaFmt(LifetimeStats.retries)
             GUI.LifeRetriesVal.Text = txt
             GUI.LifeRetriesVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.LifeRetriesVal.Position.Y)
         end
@@ -2361,9 +2414,6 @@ task.spawn(function()
                         pcall(keyrelease, VK_REFILL_KEY)
 
                         task.wait(5)     -- refill animation window
-
-                        LifetimeStats.refills = LifetimeStats.refills + 1
-                        LifetimeDirty = true
                     end
 
                     RefillingNow = false
@@ -2514,6 +2564,16 @@ task.spawn(function()
                     end
                 end)
 
+                -- Capture rewards BEFORE we start the retry sequence,
+                -- while the Rewards screen is still visible. EXP is
+                -- always slot 1_1, Gold is always slot 1_2 in AOT:R.
+                local expGain  = getRewardItemQuantity("1_1") or 0
+                local goldGain = getRewardItemQuantity("1_2") or 0
+                LifetimeStats.exp     = LifetimeStats.exp     + expGain
+                LifetimeStats.gold    = LifetimeStats.gold    + goldGain
+                LifetimeStats.retries = LifetimeStats.retries + 1
+                LifetimeDirty = true
+
                 -- Sequence: \ engages GUI nav (focus lands on Leave),
                 -- two D presses step Leave → Modify → Retry, then
                 -- Enter activates. 1.5s gap between every press so
@@ -2525,9 +2585,6 @@ task.spawn(function()
                 tap(VK_D)
                 task.wait(0.3)
                 tap(VK_ENTER)
-
-                LifetimeStats.retries = LifetimeStats.retries + 1
-                LifetimeDirty = true
             end
         end
         task.wait(0.5)
