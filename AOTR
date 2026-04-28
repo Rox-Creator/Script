@@ -1,0 +1,2616 @@
+-- Attack on Titan Revolution — Bridger-style menu
+-- Hitbox Expander + Visualizer + Auto Kill + Auto QTE
+--
+-- Controls:
+--   F3 (default) = toggle GUI visibility
+--   F1 / F2      = toggle Hitbox Expander / Auto Kill (rebindable)
+--   End          = unload
+--
+-- Settings + binds persist to c:\matcha\workspace\AOTR\RoxAOTR.json
+-- Save/Load via the Settings page.
+
+print("Version : 2.0")
+print("Made by Rox")
+
+local Players       = game:GetService("Players")
+local LocalPlayer   = Players.LocalPlayer
+local Workspace     = game:GetService("Workspace")
+local HttpService   = game:GetService("HttpService")
+local Mouse         = LocalPlayer:GetMouse()
+
+local OffsetsJSON = game:HttpGet("https://offsets.ntgetwritewatch.workers.dev/offsets.json")
+local Offsets     = HttpService:JSONDecode(OffsetsJSON)
+
+-- Forward-declared so the config helpers below can reference GUI.* fields.
+local GUI = {}
+
+-- ============================================================
+-- FEATURE STATE
+-- ============================================================
+
+local Features = {
+    HitboxExpander = false,
+    Visualizer     = false,
+    AutoKill       = false,
+    AutoQTE        = false,
+    AutoRetry      = false,
+    ErenRaid       = false,   -- Eren Raid: AutoKill but targets titans
+                              -- closest to BigRock first so they don't
+                              -- damage Eren during Defend Eren.
+}
+
+local HitboxSize    = 1000
+local KillCooldown  = 0.35
+local RefreshRate   = 0.2
+local KillKey       = nil
+local OriginalSizes = {}
+
+-- Auto Kill drop pattern: TPs the player to (nape + DropHeight) every
+-- cycle without zeroing AssemblyLinearVelocity, so downward speed
+-- builds up and the player slams through the nape at increasing speed.
+-- Floor check stops it from passing the nape (which would trigger
+-- nape-grab); an anchor every N cycles zeroes velocity so it doesn't
+-- grow unboundedly. Auto-engages its own (smaller) hitbox expansion.
+local AutoKillHitboxSize    = 150
+local AutoKillDropHeight    = 90    -- studs above nape we snap to each cycle
+local AutoKillDropDwell     = 0.20  -- max seconds to fall before TP'ing back up
+local AutoKillFloorBuffer   = 20    -- never let player fall below nape.Y + this
+local AutoKillAnchorEvery   = 8     -- cycles between INSTANT velocity resets
+                                    -- (lower = peak speed stays manageable;
+                                    --  higher = bigger slam but more nape-grab
+                                    --  / floor-overshoot risk)
+local AutoKillOriginalSizes = {}    -- separate from OriginalSizes so toggling
+                                    -- one feature doesn't clobber the other
+
+-- Hotkeys for the two primary "farms" (rebindable).
+local HitboxKey   = 0x70   -- F1 default
+local AutoKillKey = 0x71   -- F2 default
+local ListeningForBind = nil   -- "hitbox" / "autokill" while picking a key
+
+-- Visualizer state
+local VisualizerLines = {}
+local VIS_COLOR = Color3.fromRGB(95, 145, 230)
+local CornerSigns = {
+    Vector3.new(-1,-1,-1), Vector3.new( 1,-1,-1),
+    Vector3.new( 1, 1,-1), Vector3.new(-1, 1,-1),
+    Vector3.new(-1,-1, 1), Vector3.new( 1,-1, 1),
+    Vector3.new( 1, 1, 1), Vector3.new(-1, 1, 1),
+}
+local BoxEdges = {
+    {1,2},{2,3},{3,4},{4,1},
+    {5,6},{6,7},{7,8},{8,5},
+    {1,5},{2,6},{3,7},{4,8},
+}
+
+-- Stats
+local Stats = { TitansKilled = 0 }
+
+-- Uptime tracker for AutoKill (Bridger pattern).
+local killUptime = { total = 0, start = nil }
+local function uptimeSyncGeneric(u, active)
+    if active then
+        if not u.start then u.start = tick() end
+    else
+        if u.start then
+            u.total = u.total + (tick() - u.start)
+            u.start = nil
+        end
+    end
+end
+local function syncKillUptime() uptimeSyncGeneric(killUptime, Features.AutoKill) end
+local function getUptimeSeconds(u)
+    if u.start then return u.total + (tick() - u.start) end
+    return u.total
+end
+
+-- Raid tab placeholder feature flags. Stub toggles for future raid
+-- automation features — wire them up to actual logic when added.
+local RaidFlags = {
+    Slot1 = false,
+    Slot2 = false,
+    Slot3 = false,
+    Slot4 = false,
+}
+
+local VK_NAMES = {
+    [0x30]="0",[0x31]="1",[0x32]="2",[0x33]="3",[0x34]="4",
+    [0x35]="5",[0x36]="6",[0x37]="7",[0x38]="8",[0x39]="9",
+    [0x41]="A",[0x42]="B",[0x43]="C",[0x44]="D",[0x45]="E",
+    [0x46]="F",[0x47]="G",[0x48]="H",[0x49]="I",[0x4A]="J",
+    [0x4B]="K",[0x4C]="L",[0x4D]="M",[0x4E]="N",[0x4F]="O",
+    [0x50]="P",[0x51]="Q",[0x52]="R",[0x53]="S",[0x54]="T",
+    [0x55]="U",[0x56]="V",[0x57]="W",[0x58]="X",[0x59]="Y",[0x5A]="Z",
+    [0x70]="F1",[0x71]="F2",[0x72]="F3",[0x73]="F4",
+    [0x74]="F5",[0x75]="F6",[0x76]="F7",[0x77]="F8",
+    [0x78]="F9",[0x79]="F10",[0x7A]="F11",[0x7B]="F12",
+    [0x20]="Space",[0x09]="Tab",
+}
+local function getKeyName(vk) return VK_NAMES[vk] or string.format("0x%02X", vk) end
+
+-- ============================================================
+-- CONFIG PERSISTENCE
+-- ============================================================
+
+local CONFIG_DIR  = "AOTR"
+local CONFIG_PATH = CONFIG_DIR .. "/RoxAOTR.json"
+
+-- saveConfig is only called from the explicit Save button on the
+-- Settings page. Toggles and sliders DO NOT auto-save anymore — that
+-- was causing every flip of Visualizer / AutoKill / etc. to overwrite
+-- the on-disk file mid-session.
+local function saveConfig()
+    if type(writefile) ~= "function" then return end
+    local data = {
+        binds = {
+            toggle   = GUI.ToggleKey,
+            hitbox   = HitboxKey,
+            autokill = AutoKillKey,
+        },
+        settings = {
+            hitboxSize = HitboxSize,
+        },
+        features = {
+            HitboxExpander = Features.HitboxExpander,
+            Visualizer     = Features.Visualizer,
+            AutoKill       = Features.AutoKill,
+            AutoQTE        = Features.AutoQTE,
+            AutoRetry      = Features.AutoRetry,
+            ErenRaid       = Features.ErenRaid,
+        },
+    }
+    task.spawn(function()
+        pcall(function()
+            if type(makefolder) == "function" and type(isfolder) == "function"
+               and not isfolder(CONFIG_DIR) then
+                makefolder(CONFIG_DIR)
+            end
+            writefile(CONFIG_PATH, HttpService:JSONEncode(data))
+        end)
+    end)
+end
+
+local function loadConfig()
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then return end
+    if not isfile(CONFIG_PATH) then return end
+    local ok, raw = pcall(readfile, CONFIG_PATH)
+    if not (ok and raw) then return end
+    local okJ, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not (okJ and type(data) == "table") then return end
+
+    if type(data.binds) == "table" then
+        if type(data.binds.toggle)   == "number" then GUI.ToggleKey = data.binds.toggle   end
+        if type(data.binds.hitbox)   == "number" then HitboxKey     = data.binds.hitbox   end
+        if type(data.binds.autokill) == "number" then AutoKillKey   = data.binds.autokill end
+    end
+    if type(data.settings) == "table" then
+        if type(data.settings.hitboxSize) == "number" then HitboxSize = data.settings.hitboxSize end
+    end
+    if type(data.features) == "table" then
+        if type(data.features.HitboxExpander) == "boolean" then Features.HitboxExpander = data.features.HitboxExpander end
+        if type(data.features.Visualizer)     == "boolean" then Features.Visualizer     = data.features.Visualizer     end
+        if type(data.features.AutoKill)       == "boolean" then Features.AutoKill       = data.features.AutoKill       end
+        if type(data.features.AutoQTE)        == "boolean" then Features.AutoQTE        = data.features.AutoQTE        end
+        if type(data.features.AutoRetry)      == "boolean" then Features.AutoRetry      = data.features.AutoRetry      end
+        if type(data.features.ErenRaid)       == "boolean" then Features.ErenRaid       = data.features.ErenRaid       end
+        if (Features.AutoKill or Features.ErenRaid) and not killUptime.start then
+            killUptime.start = tick()
+        end
+    end
+end
+
+-- ============================================================
+-- ENGINE — titan / hitbox / attack / qte / visualizer
+-- ============================================================
+
+local function writePartSize(part, sizeVec)
+    pcall(function() part.Size = sizeVec end)
+    local okAddr, addr = pcall(function() return part.Address end)
+    if not (okAddr and addr) then return end
+    local okPrim, prim = pcall(memory_read, "uintptr_t", addr + Offsets.Primitive)
+    if not (okPrim and prim and prim ~= 0) then return end
+    pcall(memory_write, "float", prim + Offsets.PartSize + 0, sizeVec.X)
+    pcall(memory_write, "float", prim + Offsets.PartSize + 4, sizeVec.Y)
+    pcall(memory_write, "float", prim + Offsets.PartSize + 8, sizeVec.Z)
+end
+
+local function getNape(titan)
+    local hitboxes = titan:FindFirstChild("Hitboxes")
+    if not hitboxes then return nil end
+    local hit = hitboxes:FindFirstChild("Hit")
+    if not hit then return nil end
+    return hit:FindFirstChild("Nape")
+end
+
+local function findHumanoid(titan)
+    local h = titan:FindFirstChildOfClass("Humanoid")
+    if h then return h end
+    for _, child in ipairs(titan:GetChildren()) do
+        local hh = child:FindFirstChildOfClass("Humanoid")
+        if hh then return hh end
+    end
+    return nil
+end
+
+local function expandTitans()
+    local titansFolder = Workspace:FindFirstChild("Titans")
+    if not titansFolder then return end
+    local sizeVec = Vector3.new(HitboxSize, HitboxSize, HitboxSize)
+    for _, titan in ipairs(titansFolder:GetChildren()) do
+        local nape = getNape(titan)
+        if nape then
+            local okAddr, addr = pcall(function() return nape.Address end)
+            if okAddr and addr and not OriginalSizes[addr] then
+                local okSz, sz = pcall(function() return nape.Size end)
+                if okSz and sz then OriginalSizes[addr] = sz end
+            end
+            writePartSize(nape, sizeVec)
+        end
+    end
+end
+
+local function restoreTitans()
+    local titansFolder = Workspace:FindFirstChild("Titans")
+    if not titansFolder then return end
+    for _, titan in ipairs(titansFolder:GetChildren()) do
+        local nape = getNape(titan)
+        if nape then
+            local okAddr, addr = pcall(function() return nape.Address end)
+            if okAddr and addr and OriginalSizes[addr] then
+                writePartSize(nape, OriginalSizes[addr])
+            end
+        end
+    end
+    OriginalSizes = {}
+end
+
+local function restoreAutoKillTitans()
+    local titansFolder = Workspace:FindFirstChild("Titans")
+    if titansFolder then
+        for _, titan in ipairs(titansFolder:GetChildren()) do
+            local nape = getNape(titan)
+            if nape then
+                local okAddr, addr = pcall(function() return nape.Address end)
+                if okAddr and addr and AutoKillOriginalSizes[addr] then
+                    writePartSize(nape, AutoKillOriginalSizes[addr])
+                end
+            end
+        end
+    end
+    AutoKillOriginalSizes = {}
+end
+
+local function getHRP()
+    local okC, char = pcall(function() return LocalPlayer.Character end)
+    if not (okC and char) then return nil end
+    local okH, hrp = pcall(function() return char:FindFirstChild("HumanoidRootPart") end)
+    if not (okH and hrp) then return nil end
+    return hrp
+end
+
+local function getNearestNape()
+    local titansFolder = Workspace:FindFirstChild("Titans")
+    if not titansFolder then return nil end
+    local hrp = getHRP()
+    if not hrp then return nil end
+    local okPP, pPos = pcall(function() return hrp.Position end)
+    if not (okPP and pPos) then return nil end
+    local closest, closestD2 = nil, math.huge
+    for _, titan in ipairs(titansFolder:GetChildren()) do
+        if findHumanoid(titan) then
+            local nape = getNape(titan)
+            if nape then
+                local okN, npos = pcall(function() return nape.Position end)
+                if okN and npos then
+                    local dx = pPos.X - npos.X
+                    local dy = pPos.Y - npos.Y
+                    local dz = pPos.Z - npos.Z
+                    local d2 = dx*dx + dy*dy + dz*dz
+                    if d2 < closestD2 then closestD2 = d2; closest = nape end
+                end
+            end
+        end
+    end
+    return closest
+end
+
+local function performAttack()
+    if KillKey then
+        pcall(keypress, KillKey)
+        task.wait(0.05)
+        pcall(keyrelease, KillKey)
+    else
+        pcall(mouse1press)
+        task.wait(0.06)
+        pcall(mouse1release)
+    end
+end
+
+-- Returns nearest titan that still has a Humanoid, with both the
+-- titan model and its nape. Returns nil, nil if none.
+local function getNearestLiveTitan()
+    local titansFolder = Workspace:FindFirstChild("Titans")
+    if not titansFolder then return nil, nil end
+    local hrp = getHRP()
+    if not hrp then return nil, nil end
+    local okPP, pPos = pcall(function() return hrp.Position end)
+    if not (okPP and pPos) then return nil, nil end
+    local bestTitan, bestNape, bestD2 = nil, nil, math.huge
+    for _, titan in ipairs(titansFolder:GetChildren()) do
+        if findHumanoid(titan) then
+            local nape = getNape(titan)
+            if nape then
+                local okN, npos = pcall(function() return nape.Position end)
+                if okN and npos then
+                    local dx = pPos.X - npos.X
+                    local dy = pPos.Y - npos.Y
+                    local dz = pPos.Z - npos.Z
+                    local d2 = dx*dx + dy*dy + dz*dz
+                    if d2 < bestD2 then
+                        bestD2 = d2; bestTitan = titan; bestNape = nape
+                    end
+                end
+            end
+        end
+    end
+    return bestTitan, bestNape
+end
+
+-- Eren Raid: returns the live titan whose nape is closest to the
+-- BigRock (not the player). Falls back to nearest-to-player if the
+-- rock isn't reachable. Sorting only by distance to rock means the
+-- loop will always cycle to whichever titan is the biggest threat.
+local function getNearestLiveTitanToRock()
+    local rockPos
+    pcall(function()
+        rockPos = Workspace.Unclimbable.Objective.Defend_Eren.BigRock.Position
+    end)
+    if not rockPos then return getNearestLiveTitan() end
+
+    local titansFolder = Workspace:FindFirstChild("Titans")
+    if not titansFolder then return nil, nil end
+    local bestTitan, bestNape, bestD2 = nil, nil, math.huge
+    for _, titan in ipairs(titansFolder:GetChildren()) do
+        if findHumanoid(titan) then
+            local nape = getNape(titan)
+            if nape then
+                local okN, npos = pcall(function() return nape.Position end)
+                if okN and npos then
+                    local dx = rockPos.X - npos.X
+                    local dy = rockPos.Y - npos.Y
+                    local dz = rockPos.Z - npos.Z
+                    local d2 = dx*dx + dy*dy + dz*dz
+                    if d2 < bestD2 then
+                        bestD2 = d2; bestTitan = titan; bestNape = nape
+                    end
+                end
+            end
+        end
+    end
+    return bestTitan, bestNape
+end
+
+-- Detects whether the target titan currently has any "*grab*"
+-- attribute set, e.g. Left_nape_grab / Right_nape_grab / Left_air_grab
+-- / right_air_grab. AOT:R sets these mid-grab animation. The Auto Kill
+-- loop bails (TPs high, freezes 0.5s) when any of these go true so
+-- the player isn't held inside the titan's grab hitbox.
+local function isTitanGrabbing(titan)
+    if not titan then return false end
+    local attrs
+    pcall(function() attrs = titan:GetAttributes() end)
+    if type(attrs) ~= "table" then return false end
+    for k, v in pairs(attrs) do
+        if v and string.lower(tostring(k)):find("grab") then
+            return true
+        end
+    end
+    return false
+end
+
+local function getOrCreateLine(idx)
+    local ln = VisualizerLines[idx]
+    if ln then return ln end
+    ln = Drawing.new("Line")
+    ln.Color = VIS_COLOR
+    ln.Thickness = 1
+    ln.Visible = false
+    ln.ZIndex = 50
+    VisualizerLines[idx] = ln
+    return ln
+end
+
+-- Free every Drawing.Line in the pool. Hiding them isn't enough —
+-- Matcha caps total Drawing instances and a hidden line still counts
+-- against that budget, which is what eventually crashes us if the
+-- user toggles the visualizer on/off across a long session.
+local function hideAllVisualizerLines()
+    for _, ln in ipairs(VisualizerLines) do
+        pcall(function() ln:Remove() end)
+    end
+    VisualizerLines = {}
+end
+
+local function updateVisualizer()
+    if not Features.Visualizer then hideAllVisualizerLines() return end
+    local titansFolder = Workspace:FindFirstChild("Titans")
+    if not titansFolder then hideAllVisualizerLines() return end
+    local lineIdx = 0
+    for _, titan in ipairs(titansFolder:GetChildren()) do
+        local nape = findHumanoid(titan) and getNape(titan) or nil
+        if nape then
+            local okSz, sz  = pcall(function() return nape.Size end)
+            local okCF, cf  = pcall(function() return nape.CFrame end)
+            local okPos, ps = pcall(function() return nape.Position end)
+            if okSz and sz and ((okCF and cf) or (okPos and ps)) then
+                local hx, hy, hz = sz.X / 2, sz.Y / 2, sz.Z / 2
+                local screenCorners = {}
+                local anyOnScreen = false
+                for i = 1, 8 do
+                    local s = CornerSigns[i]
+                    local world
+                    if cf then
+                        local okW, w = pcall(function()
+                            return cf * Vector3.new(s.X * hx, s.Y * hy, s.Z * hz)
+                        end)
+                        if okW then world = w end
+                    else
+                        world = ps + Vector3.new(s.X * hx, s.Y * hy, s.Z * hz)
+                    end
+                    if world then
+                        local s2d, onScreen = WorldToScreen(world)
+                        if s2d then
+                            screenCorners[i] = s2d
+                            if onScreen then anyOnScreen = true end
+                        end
+                    end
+                end
+                if anyOnScreen then
+                    for _, e in ipairs(BoxEdges) do
+                        local p1 = screenCorners[e[1]]
+                        local p2 = screenCorners[e[2]]
+                        if p1 and p2 then
+                            lineIdx = lineIdx + 1
+                            local ln = getOrCreateLine(lineIdx)
+                            pcall(function()
+                                ln.From = p1; ln.To = p2; ln.Visible = true
+                            end)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    for i = lineIdx + 1, #VisualizerLines do
+        pcall(function() VisualizerLines[i].Visible = false end)
+    end
+end
+
+-- Forward-decl so toggle handlers can flip features through one path.
+local setHitboxOn, setAutoKillOn, applyMinimizedState
+local CreateContent, ClearContent, UnloadScript
+
+-- ============================================================
+-- GUI STATE
+-- ============================================================
+
+GUI.Elements         = {}
+GUI.NavElements      = {}
+GUI.NavClickables    = {}
+GUI.SubTabElements   = {}
+GUI.ContentElements  = {}
+GUI.LiveElements     = {}
+GUI.Clickables       = {}
+GUI.Visible          = true
+GUI.Dragging         = false
+GUI.DragOffsetX      = 0
+GUI.DragOffsetY      = 0
+GUI.WasMouseDown     = false
+GUI.ToggleKey        = 0x72   -- F3 default; rebindable in Settings
+GUI.WasToggleDown    = false
+GUI.WasEndDown       = false
+GUI.EndKeyReady      = false
+GUI.Running          = true
+GUI.HintText         = nil
+GUI.StatusText       = nil
+GUI.StatusDot        = nil
+GUI.SelectedPage     = "Main"
+GUI.SubTab           = "Automation"
+GUI.ListeningForKey  = false
+GUI.Minimized        = false
+GUI.MiniElements     = {}
+GUI.MiniLiveElements = {}
+GUI.MiniTitansVal    = nil
+GUI.MiniSizeVal      = nil
+GUI.MiniKilledVal    = nil
+GUI.MiniUptimeVal    = nil
+GUI.WasHitboxKeyDown   = false
+GUI.WasAutoKillKeyDown = false
+GUI.ActiveSlider     = nil
+GUI.EditingSlider    = nil
+GUI.SliderBuffer     = ""
+GUI.SliderKeyState   = {}
+GUI.ContentGen       = 0
+GUI.AnimToken        = 0
+-- Live-stat element refs (populated per-page)
+GUI.TitansVal        = nil
+GUI.HitboxSizeVal    = nil
+GUI.KillsVal         = nil
+GUI.UptimeVal        = nil
+
+local VK_END = 0x23
+
+-- ============================================================
+-- THEME (Bridger blue palette)
+-- ============================================================
+
+local Colors = {
+    WindowBg     = Color3.fromRGB(18, 22, 32),
+    HeaderBg     = Color3.fromRGB(26, 32, 46),
+    HeaderInfoBg = Color3.fromRGB(40, 50, 70),
+    CardBg       = Color3.fromRGB(22, 28, 42),
+    CardBorder   = Color3.fromRGB(48, 60, 86),
+    FooterBg     = Color3.fromRGB(22, 28, 42),
+    AccentRed    = Color3.fromRGB(95, 145, 230),
+    TextPrimary  = Color3.fromRGB(220, 224, 235),
+    TextMuted    = Color3.fromRGB(110, 120, 145),
+    Separator    = Color3.fromRGB(40, 50, 70),
+    ToggleOn     = Color3.fromRGB(95, 145, 230),
+    ToggleOff    = Color3.fromRGB(40, 50, 70),
+    StatusOn     = Color3.fromRGB(80, 220, 140),
+    StatusOff   = Color3.fromRGB(255, 80, 100),
+    HitboxColor  = Color3.fromRGB(60, 160, 255),
+    KillColor    = Color3.fromRGB(255, 100, 100),
+    QTEColor     = Color3.fromRGB(255, 200, 60),
+    DebugColor   = Color3.fromRGB(180, 130, 255),
+}
+
+local Config = {
+    WinW        = 700,
+    WinH        = 580,
+    HeaderH     = 50,
+    TabStripH   = 38,
+    SubTabH     = 32,
+    FooterH     = 28,
+    Corner      = 6,
+    ToggleW     = 32,
+    ToggleH     = 16,
+    ContentPad  = 20,
+    RowHeight   = 36,
+    CardPad     = 14,
+    ColGap      = 14,
+}
+
+local SCRIPT_NAME    = "Rox's Menu"
+local SCRIPT_TAGLINE = "|   AOT: Revolution"
+local SCRIPT_VERSION = "v2.0"
+
+Config.WinX = 140
+Config.WinY = 140
+
+-- ============================================================
+-- COLOR / GEOMETRY HELPERS
+-- ============================================================
+
+local function clamp01(v)
+    if v < 0 then return 0 end
+    if v > 1 then return 1 end
+    return v
+end
+
+local function lerpColor(a, b, t)
+    return Color3.new(
+        a.R + (b.R - a.R) * t,
+        a.G + (b.G - a.G) * t,
+        a.B + (b.B - a.B) * t
+    )
+end
+
+local function lighten(c, amount)
+    return Color3.new(clamp01(c.R + amount), clamp01(c.G + amount), clamp01(c.B + amount))
+end
+
+local function IsInside(mx, my, x, y, w, h)
+    return mx >= x and mx <= x + w and my >= y and my <= y + h
+end
+
+local function splitCols(cardX, cardW)
+    local colW = (cardW - Config.ColGap) / 2
+    return cardX, cardX + colW + Config.ColGap, colW
+end
+
+-- Animation token used to invalidate in-flight tweens on drag / rebuild
+local function newAnimToken()
+    GUI.AnimToken = GUI.AnimToken + 1
+    return GUI.AnimToken
+end
+local function isAnimCurrent(token) return token == GUI.AnimToken end
+
+-- Press effect (gen-checked so Luraph doesn't log dead-element accesses).
+local function pressEffect(el)
+    if not el then return end
+    local gen = GUI.ContentGen
+    task.spawn(function()
+        if GUI.ContentGen ~= gen then return end
+        local okP, pos = pcall(function() return el.Position end)
+        local okS, sz  = pcall(function() return el.Size end)
+        if not (okP and pos and okS and sz) then return end
+        if type(pos) ~= "userdata" and type(pos) ~= "table" then return end
+        if GUI.ContentGen ~= gen then return end
+        pcall(function()
+            el.Position = Vector2.new(pos.X + 1, pos.Y + 1)
+            el.Size     = Vector2.new(sz.X - 2, sz.Y - 2)
+        end)
+        task.wait(0.07)
+        if GUI.ContentGen ~= gen then return end
+        pcall(function() el.Position = pos; el.Size = sz end)
+    end)
+end
+
+local function animateToggle(knob, bg, fromX, toX, fromColor, toColor, onDone)
+    local gen = GUI.ContentGen
+    task.spawn(function()
+        local steps, stepTime = 8, 0.018
+        for i = 1, steps do
+            if GUI.ContentGen ~= gen then break end
+            local t = i / steps
+            local et = 1 - (1 - t) ^ 3
+            pcall(function()
+                local okPos = pcall(function() return knob.Position end)
+                if not okPos then return end
+                knob.Position = Vector2.new(fromX + (toX - fromX) * et, knob.Position.Y)
+                bg.Color      = lerpColor(fromColor, toColor, et)
+            end)
+            task.wait(stepTime)
+        end
+        if onDone then pcall(onDone) end
+    end)
+end
+
+-- ============================================================
+-- TOOLTIP SYSTEM
+-- ============================================================
+
+local tooltipEls = {}
+
+local function clearTooltip()
+    for _, el in ipairs(tooltipEls) do
+        pcall(function() el:Remove() end)
+    end
+    tooltipEls = {}
+end
+
+local function showTooltip(text, x, y)
+    clearTooltip()
+    if not text or text == "" then return end
+    local lines = {}
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do table.insert(lines, line) end
+    while #lines > 0 and lines[#lines] == "" do table.remove(lines, #lines) end
+    if #lines == 0 then return end
+
+    local pad, lineH, fontSize, charW = 8, 14, 11, 6
+    local maxChars = 0
+    for _, line in ipairs(lines) do
+        if #line > maxChars then maxChars = #line end
+    end
+    local boxW = maxChars * charW + pad * 2
+    local boxH = #lines * lineH + pad
+
+    local vpW, vpH = 1920, 1080
+    local cam = Workspace and Workspace.CurrentCamera
+    if cam then
+        local ok, vp = pcall(function() return cam.ViewportSize end)
+        if ok and vp and vp.X and vp.X > 0 then vpW, vpH = vp.X, vp.Y end
+    end
+    if x + boxW > vpW - 4 then x = vpW - boxW - 4 end
+    if y + boxH > vpH - 4 then y = vpH - boxH - 4 end
+    if x < 4 then x = 4 end
+    if y < 4 then y = 4 end
+
+    local bg = Drawing.new("Square")
+    bg.Position = Vector2.new(x, y); bg.Size = Vector2.new(boxW, boxH)
+    bg.Color = Colors.HeaderBg; bg.Filled = true; bg.Corner = 4
+    bg.Visible = true; bg.ZIndex = 95
+    table.insert(tooltipEls, bg)
+
+    local border = Drawing.new("Square")
+    border.Position = Vector2.new(x, y); border.Size = Vector2.new(boxW, boxH)
+    border.Color = Colors.AccentRed; border.Filled = false; border.Thickness = 1
+    border.Corner = 4; border.Visible = true; border.ZIndex = 96
+    table.insert(tooltipEls, border)
+
+    for i, line in ipairs(lines) do
+        local txt = Drawing.new("Text")
+        txt.Position = Vector2.new(x + pad, y + pad - 4 + (i - 1) * lineH)
+        txt.Text = line; txt.Color = Colors.TextPrimary
+        txt.Size = fontSize; txt.Font = Drawing.Fonts.System
+        txt.Center = false; txt.Outline = false
+        txt.Visible = true; txt.ZIndex = 97
+        table.insert(tooltipEls, txt)
+    end
+end
+
+-- ============================================================
+-- DRAW HELPERS
+-- ============================================================
+
+local function ClearSubTabs()
+    for _, el in ipairs(GUI.SubTabElements) do
+        pcall(function() el:Remove() end)
+    end
+    GUI.SubTabElements = {}
+    GUI.SubTabUnderline = nil
+    GUI.SubTabGlow = nil
+end
+
+ClearContent = function()
+    ClearSubTabs()
+    clearTooltip()
+    GUI.ContentGen = GUI.ContentGen + 1
+    for _, el in ipairs(GUI.ContentElements) do
+        pcall(function() el:Remove() end)
+    end
+    GUI.ContentElements = {}
+    GUI.LiveElements    = {}
+    GUI.Clickables      = {}
+    GUI.TitansVal       = nil
+    GUI.HitboxSizeVal   = nil
+    GUI.KillsVal        = nil
+    GUI.UptimeVal       = nil
+end
+
+local function DrawCard(x, y, w, h, title, zbase)
+    local bg = Drawing.new("Square")
+    bg.Position = Vector2.new(x, y); bg.Size = Vector2.new(w, h)
+    bg.Color = Colors.CardBg; bg.Filled = true; bg.Corner = 5
+    bg.Visible = true; bg.ZIndex = zbase
+    table.insert(GUI.ContentElements, bg)
+
+    local border = Drawing.new("Square")
+    border.Position = Vector2.new(x, y); border.Size = Vector2.new(w, h)
+    border.Color = Colors.CardBorder; border.Filled = false; border.Corner = 5
+    border.Thickness = 1; border.Visible = true; border.ZIndex = zbase + 1
+    table.insert(GUI.ContentElements, border)
+
+    if title and title ~= "" then
+        local titleEl = Drawing.new("Text")
+        titleEl.Position = Vector2.new(x + Config.CardPad, y + 10)
+        titleEl.Text = title; titleEl.Color = Colors.AccentRed
+        titleEl.Size = 16; titleEl.Font = Drawing.Fonts.SystemBold
+        titleEl.Center = false; titleEl.Outline = false
+        titleEl.Visible = true; titleEl.ZIndex = zbase + 3
+        table.insert(GUI.ContentElements, titleEl)
+
+        local underline = Drawing.new("Line")
+        underline.From = Vector2.new(x + 1, y + 38)
+        underline.To   = Vector2.new(x + w - 1, y + 38)
+        underline.Color = Colors.AccentRed; underline.Thickness = 1
+        underline.Visible = true; underline.ZIndex = zbase + 3
+        table.insert(GUI.ContentElements, underline)
+    end
+    return y + 52
+end
+
+local function DrawCardToggleRow(cardX, cardW, curY, label, isOn, dotColor, zbase, onClick)
+    local lx = cardX + Config.CardPad
+    local rightEdge = cardX + cardW - Config.CardPad
+
+    local lbl = Drawing.new("Text")
+    lbl.Position = Vector2.new(lx, curY + 2)
+    lbl.Text = label; lbl.Color = Colors.TextPrimary
+    lbl.Size = 14; lbl.Font = Drawing.Fonts.System
+    lbl.Center = false; lbl.Outline = false
+    lbl.Visible = true; lbl.ZIndex = zbase + 5
+    table.insert(GUI.ContentElements, lbl)
+
+    local tw, th = Config.ToggleW, Config.ToggleH
+    local toggleX = rightEdge - tw
+    local bgColor = isOn and Colors.ToggleOn or Colors.ToggleOff
+
+    local bg = Drawing.new("Square")
+    bg.Position = Vector2.new(toggleX, curY + 1); bg.Size = Vector2.new(tw, th)
+    bg.Color = bgColor; bg.Filled = true; bg.Corner = 8
+    bg.Visible = true; bg.ZIndex = zbase + 3
+    table.insert(GUI.ContentElements, bg)
+
+    local offX = toggleX + 2
+    local onX  = toggleX + tw - th + 2
+    local knobX = isOn and onX or offX
+    local knob = Drawing.new("Circle")
+    knob.Position = Vector2.new(knobX + (th - 4) / 2, curY + 1 + th / 2)
+    knob.Radius = (th - 4) / 2
+    knob.Color = Color3.fromRGB(230, 234, 245)
+    knob.Filled = true; knob.NumSides = 16
+    knob.Visible = true; knob.ZIndex = zbase + 4
+    table.insert(GUI.ContentElements, knob)
+
+    table.insert(GUI.Clickables, {
+        x = toggleX - 20, y = curY,
+        w = tw + 20, h = th + 4,
+        hover = { el = bg, base = bgColor },
+        onClick = function()
+            local newOn = not isOn
+            local fromX = isOn  and onX or offX
+            local toX   = newOn and onX or offX
+            local fromC = isOn  and Colors.ToggleOn or Colors.ToggleOff
+            local toC   = newOn and Colors.ToggleOn or Colors.ToggleOff
+            local off = (th - 4) / 2
+            animateToggle(knob, bg, fromX + off, toX + off, fromC, toC, onClick)
+        end,
+    })
+end
+
+local function DrawStatRow(cardX, cardW, curY, label, initialValue, zbase)
+    local lx = cardX + Config.CardPad
+    local rightEdge = cardX + cardW - Config.CardPad
+
+    local lbl = Drawing.new("Text")
+    lbl.Position = Vector2.new(lx, curY + 2)
+    lbl.Text = label; lbl.Color = Colors.TextMuted
+    lbl.Size = 13; lbl.Font = Drawing.Fonts.System
+    lbl.Center = false; lbl.Outline = false
+    lbl.Visible = true; lbl.ZIndex = zbase + 5
+    table.insert(GUI.ContentElements, lbl)
+
+    local val = Drawing.new("Text")
+    val.Text = tostring(initialValue)
+    val.Color = Colors.TextPrimary
+    val.Size = 15; val.Font = Drawing.Fonts.SystemBold
+    val.Center = false; val.Outline = false
+    val.Visible = true; val.ZIndex = zbase + 5
+    local estW = #val.Text * 8
+    val.Position = Vector2.new(rightEdge - estW, curY + 1)
+    table.insert(GUI.ContentElements, val)
+    table.insert(GUI.LiveElements, val)
+    return val, rightEdge
+end
+
+local function DrawSlider(x, y, w, label, value, minV, maxV, valueFmt, onChange, zbase, helpText)
+    local trackH, knobR, labelH = 6, 7, 16
+    local trackY = y + labelH + 6
+    local knobY  = trackY + trackH / 2
+
+    local v = math.max(minV, math.min(maxV, value))
+    local pct = (v - minV) / (maxV - minV)
+    local fillW = w * pct
+    local knobX = x + fillW
+
+    local lbl = Drawing.new("Text")
+    lbl.Position = Vector2.new(x, y)
+    lbl.Text = label; lbl.Color = Colors.TextPrimary
+    lbl.Size = 13; lbl.Font = Drawing.Fonts.System
+    lbl.Center = false; lbl.Outline = false
+    lbl.Visible = true; lbl.ZIndex = zbase + 5
+    table.insert(GUI.ContentElements, lbl)
+
+    if helpText then
+        local labelEstW = #label * 7
+        local helpX = x + labelEstW + 2
+        local helpY = y
+
+        local helpBg = Drawing.new("Circle")
+        helpBg.Position = Vector2.new(helpX + 3, helpY + 7)
+        helpBg.Radius = 8; helpBg.Color = Color3.new(0, 0, 0)
+        helpBg.Filled = true; helpBg.NumSides = 24
+        helpBg.Transparency = 0.55
+        helpBg.Visible = true; helpBg.ZIndex = zbase + 4
+        table.insert(GUI.ContentElements, helpBg)
+
+        local helpIcon = Drawing.new("Text")
+        helpIcon.Position = Vector2.new(helpX, helpY)
+        helpIcon.Text = "?"; helpIcon.Color = Colors.TextMuted
+        helpIcon.Size = 13; helpIcon.Font = Drawing.Fonts.SystemBold
+        helpIcon.Center = false; helpIcon.Outline = false
+        helpIcon.Visible = true; helpIcon.ZIndex = zbase + 5
+        table.insert(GUI.ContentElements, helpIcon)
+
+        table.insert(GUI.Clickables, {
+            x = helpX - 4, y = helpY - 2, w = 16, h = 18,
+            hover = { el = helpIcon, base = Colors.TextMuted },
+            tooltip = helpText,
+            onClick = function() end,
+        })
+    end
+
+    local isEditing = GUI.EditingSlider and GUI.EditingSlider.label == label
+    local valStr   = isEditing and (GUI.SliderBuffer .. "_") or string.format(valueFmt, v)
+    local valTxt = Drawing.new("Text")
+    valTxt.Text = valStr
+    valTxt.Color = isEditing and Colors.AccentRed or Colors.TextPrimary
+    valTxt.Size = 13; valTxt.Font = Drawing.Fonts.SystemBold
+    valTxt.Center = false; valTxt.Outline = false
+    valTxt.Visible = true; valTxt.ZIndex = zbase + 5
+    valTxt.Position = Vector2.new(x + w - #valStr * 7, y)
+    table.insert(GUI.ContentElements, valTxt)
+    if isEditing then GUI.EditingSlider.valTxt = valTxt end
+
+    local track = Drawing.new("Square")
+    track.Position = Vector2.new(x, trackY); track.Size = Vector2.new(w, trackH)
+    track.Color = Colors.ToggleOff; track.Filled = true; track.Corner = trackH / 2
+    track.Visible = true; track.ZIndex = zbase + 3
+    table.insert(GUI.ContentElements, track)
+
+    local fill = Drawing.new("Square")
+    fill.Position = Vector2.new(x, trackY)
+    fill.Size = Vector2.new(math.max(0.001, fillW), trackH)
+    fill.Color = Colors.AccentRed; fill.Filled = true; fill.Corner = trackH / 2
+    fill.Visible = fillW > 0; fill.ZIndex = zbase + 4
+    table.insert(GUI.ContentElements, fill)
+
+    local knob = Drawing.new("Circle")
+    knob.Position = Vector2.new(knobX, knobY)
+    knob.Radius = knobR
+    knob.Color = Color3.fromRGB(230, 234, 245)
+    knob.Filled = true; knob.NumSides = 16
+    knob.Visible = true; knob.ZIndex = zbase + 5
+    table.insert(GUI.ContentElements, knob)
+
+    local function setFromMouse()
+        local pctClick = (Mouse.X - x) / w
+        pctClick = math.max(0, math.min(1, pctClick))
+        local newVal = minV + pctClick * (maxV - minV)
+        local newFillW = w * pctClick
+        local newKnobX = x + newFillW
+        local newStr = string.format(valueFmt, newVal)
+        pcall(function()
+            knob.Position = Vector2.new(newKnobX, knobY)
+            fill.Size = Vector2.new(math.max(0.001, newFillW), trackH)
+            fill.Visible = newFillW > 0
+            valTxt.Text = newStr
+            valTxt.Position = Vector2.new(x + w - #newStr * 7, y)
+        end)
+        onChange(newVal)
+    end
+
+    local valHitW = 60
+    local valHitX = x + w - valHitW
+    local valHitY = y - 2
+    local valHitH = 18
+    table.insert(GUI.Clickables, {
+        x = valHitX, y = valHitY, w = valHitW, h = valHitH,
+        hover = { el = valTxt, base = valTxt.Color },
+        onClick = function()
+            GUI.EditingSlider = {
+                label    = label,
+                minV     = minV,
+                maxV     = maxV,
+                onChange = onChange,
+                valTxt   = valTxt,
+            }
+            GUI.SliderBuffer = ""
+            GUI.SliderKeyState = {}
+            notify("Type a number. Enter to save, Esc to cancel.", "AOT:R", 4)
+            CreateContent()
+        end,
+    })
+
+    table.insert(GUI.Clickables, {
+        x = x - knobR, y = trackY - knobR,
+        w = w + 2 * knobR, h = trackH + 2 * knobR,
+        sliderDrag = setFromMouse,
+        onClick = setFromMouse,
+    })
+
+    return trackY + trackH + 6
+end
+
+local function DrawSmallButton(bx, by, bw, bh, text, color, zbase, onClick, textYOff)
+    local bg = Drawing.new("Square")
+    bg.Position = Vector2.new(bx, by); bg.Size = Vector2.new(bw, bh)
+    bg.Color = color; bg.Filled = true; bg.Corner = 4
+    bg.Visible = true; bg.ZIndex = zbase + 3
+    table.insert(GUI.ContentElements, bg)
+
+    local txt = Drawing.new("Text")
+    txt.Position = Vector2.new(bx + bw / 2, by + (bh - 12) / 2 + (textYOff or 0))
+    txt.Text = text; txt.Color = Colors.TextPrimary
+    txt.Size = 12; txt.Font = Drawing.Fonts.SystemBold
+    txt.Center = true; txt.Outline = false
+    txt.Visible = true; txt.ZIndex = zbase + 5
+    table.insert(GUI.ContentElements, txt)
+
+    table.insert(GUI.Clickables, {
+        x = bx, y = by, w = bw, h = bh,
+        hover = { el = bg, base = color },
+        onClick = onClick,
+    })
+end
+
+-- Bind button (rectangle pill that displays a key name; click to listen).
+local function DrawBindButton(bx, by, keyVK, isListening, zbase, onClick)
+    local btnW, btnH = 80, 26
+
+    local bg = Drawing.new("Square")
+    bg.Position = Vector2.new(bx, by); bg.Size = Vector2.new(btnW, btnH)
+    bg.Color = isListening and Colors.AccentRed or Colors.ToggleOff
+    bg.Filled = true; bg.Corner = 4
+    bg.Visible = true; bg.ZIndex = zbase + 3
+    table.insert(GUI.ContentElements, bg)
+
+    local txt = Drawing.new("Text")
+    txt.Position = Vector2.new(bx + btnW / 2, by + 6)
+    txt.Text = isListening and "..." or getKeyName(keyVK)
+    txt.Color = Colors.TextPrimary
+    txt.Size = 13; txt.Font = Drawing.Fonts.SystemBold
+    txt.Center = true; txt.Outline = false
+    txt.Visible = true; txt.ZIndex = zbase + 5
+    table.insert(GUI.ContentElements, txt)
+
+    table.insert(GUI.Clickables, {
+        x = bx, y = by, w = btnW, h = btnH,
+        hover = { el = bg, base = bg.Color },
+        onClick = onClick,
+    })
+end
+
+-- ============================================================
+-- NAV + SUBTAB BARS
+-- ============================================================
+
+local NavDefs = {
+    { name = "Main",     dot = Colors.AccentRed },
+    { name = "Raid",     dot = Colors.TextMuted },
+    { name = "Settings", dot = Colors.TextMuted },
+}
+
+local NavButtonHandles = {}
+
+local function refreshNavButton(handles, selected)
+    if not handles then return end
+    if handles.dot then
+        pcall(function()
+            handles.dot.Color = selected and Colors.AccentRed or Colors.TextMuted
+        end)
+    end
+    if handles.text then
+        pcall(function()
+            handles.text.Color = selected and Colors.TextPrimary or Colors.TextMuted
+            handles.text.Font  = selected and Drawing.Fonts.SystemBold or Drawing.Fonts.System
+        end)
+    end
+end
+
+local function CreateMainTabs()
+    local wx, wy = Config.WinX, Config.WinY
+    local barY = wy + Config.HeaderH
+    local barH = Config.TabStripH
+    local nTabs = #NavDefs
+    local tabW = Config.WinW / nTabs
+
+    local stripBg = Drawing.new("Square")
+    stripBg.Position = Vector2.new(wx, barY)
+    stripBg.Size = Vector2.new(Config.WinW, barH)
+    stripBg.Color = Colors.HeaderBg
+    stripBg.Filled = true; stripBg.Visible = true; stripBg.ZIndex = 4
+    table.insert(GUI.NavElements, stripBg)
+
+    for i, def in ipairs(NavDefs) do
+        local zoneX = wx + (i - 1) * tabW
+        local zoneCenter = zoneX + tabW / 2
+        local selected = (def.name == GUI.SelectedPage)
+
+        local labelW = #def.name * 10
+        local pairW  = 8 + 8 + labelW
+        local pairStart = zoneCenter - pairW / 2
+
+        local dot = Drawing.new("Circle")
+        dot.Position = Vector2.new(pairStart + 5, barY + barH / 2 + 1)
+        dot.Radius = 4; dot.Color = selected and Colors.AccentRed or Colors.TextMuted
+        dot.Filled = true; dot.NumSides = 16
+        dot.Visible = true; dot.ZIndex = 6
+        table.insert(GUI.NavElements, dot)
+
+        local txt = Drawing.new("Text")
+        txt.Position = Vector2.new(pairStart + 16, barY + 10)
+        txt.Text = def.name
+        txt.Color = selected and Colors.TextPrimary or Colors.TextMuted
+        txt.Size = 18
+        txt.Font = selected and Drawing.Fonts.SystemBold or Drawing.Fonts.System
+        txt.Center = false; txt.Outline = false
+        txt.Visible = true; txt.ZIndex = 6
+        table.insert(GUI.NavElements, txt)
+
+        if selected then
+            local underline = Drawing.new("Line")
+            underline.From = Vector2.new(zoneCenter - 44, barY + barH - 3)
+            underline.To   = Vector2.new(zoneCenter + 44, barY + barH - 3)
+            underline.Color = Colors.AccentRed; underline.Thickness = 2
+            underline.Visible = true; underline.ZIndex = 6
+            table.insert(GUI.NavElements, underline)
+            GUI.MainTabUnderline = underline
+        end
+
+        if i == 1 then
+            local sep = Drawing.new("Line")
+            sep.From = Vector2.new(wx, barY + barH)
+            sep.To   = Vector2.new(wx + Config.WinW, barY + barH)
+            sep.Color = Colors.Separator; sep.Thickness = 1
+            sep.Visible = true; sep.ZIndex = 5
+            table.insert(GUI.NavElements, sep)
+        end
+
+        NavButtonHandles[def.name] = { dot = dot, text = txt }
+
+        local clickName = def.name
+        table.insert(GUI.NavClickables, {
+            x = zoneX, y = barY, w = tabW, h = barH,
+            onClick = function()
+                if GUI.SelectedPage == clickName then return end
+                local oldName = GUI.SelectedPage
+                GUI.SelectedPage = clickName
+                if clickName == "Main" then GUI.SubTab = GUI.SubTab or "Automation" end
+                for _, n in ipairs(NavDefs) do
+                    refreshNavButton(NavButtonHandles[n.name], n.name == clickName)
+                end
+                local under = GUI.MainTabUnderline
+                local function rebuild() CreateContent() end
+                if under then
+                    local fromIdx, toIdx = 1, 1
+                    for j, d in ipairs(NavDefs) do
+                        if d.name == oldName  then fromIdx = j end
+                        if d.name == clickName then toIdx  = j end
+                    end
+                    local liveWx   = Config.WinX
+                    local liveBarY = Config.WinY + Config.HeaderH
+                    local fromCenter = liveWx + (fromIdx - 1) * tabW + tabW / 2
+                    local toCenter   = liveWx + (toIdx  - 1) * tabW + tabW / 2
+                    local lineY      = liveBarY + barH - 3
+                    local token = newAnimToken()
+                    task.spawn(function()
+                        local steps = 10
+                        for s = 1, steps do
+                            if not isAnimCurrent(token) then return end
+                            local t = s / steps
+                            local et = 1 - (1 - t) ^ 3
+                            local cx = fromCenter + (toCenter - fromCenter) * et
+                            pcall(function()
+                                under.From = Vector2.new(cx - 44, lineY)
+                                under.To   = Vector2.new(cx + 44, lineY)
+                            end)
+                            task.wait(0.018)
+                        end
+                        rebuild()
+                    end)
+                else
+                    rebuild()
+                end
+            end,
+        })
+    end
+end
+
+local SubTabDefs = { "Automation" }
+
+local function CreateSubTabs()
+    if GUI.SelectedPage ~= "Main" then return end
+    local wx, wy = Config.WinX, Config.WinY
+    local barY = wy + Config.HeaderH + Config.TabStripH
+    local barH = Config.SubTabH
+    local tabW = Config.WinW / #SubTabDefs
+
+    for i, name in ipairs(SubTabDefs) do
+        local zoneX = wx + (i - 1) * tabW
+        local selected = (GUI.SubTab == name)
+
+        if selected then
+            local glow = Drawing.new("Square")
+            glow.Position = Vector2.new(zoneX, barY); glow.Size = Vector2.new(tabW, barH)
+            glow.Color = Colors.AccentRed; glow.Filled = true
+            glow.Transparency = 0.12
+            glow.Visible = true; glow.ZIndex = 4
+            table.insert(GUI.SubTabElements, glow)
+            GUI.SubTabGlow = glow
+        end
+
+        local txt = Drawing.new("Text")
+        txt.Position = Vector2.new(zoneX + tabW / 2, barY + 14)
+        txt.Text = name
+        txt.Color = selected and Colors.TextPrimary or Colors.TextMuted
+        txt.Size = 14
+        txt.Font = selected and Drawing.Fonts.SystemBold or Drawing.Fonts.System
+        txt.Center = true; txt.Outline = false
+        txt.Visible = true; txt.ZIndex = 6
+        table.insert(GUI.SubTabElements, txt)
+
+        if selected then
+            local underline = Drawing.new("Line")
+            underline.From = Vector2.new(zoneX + 1, barY + barH - 2)
+            underline.To = Vector2.new(zoneX + tabW - 1, barY + barH - 2)
+            underline.Color = Colors.AccentRed; underline.Thickness = 2
+            underline.Visible = true; underline.ZIndex = 6
+            table.insert(GUI.SubTabElements, underline)
+            GUI.SubTabUnderline = underline
+        end
+
+        if i == 1 then
+            local sep = Drawing.new("Line")
+            sep.From = Vector2.new(wx, barY + barH)
+            sep.To = Vector2.new(wx + Config.WinW, barY + barH)
+            sep.Color = Colors.Separator; sep.Thickness = 1
+            sep.Visible = true; sep.ZIndex = 5
+            table.insert(GUI.SubTabElements, sep)
+        end
+
+        local clickName = name
+        table.insert(GUI.Clickables, {
+            x = zoneX, y = barY, w = tabW, h = barH,
+            onClick = function()
+                if GUI.SubTab == clickName then return end
+                local oldName = GUI.SubTab
+                GUI.SubTab = clickName
+                local under = GUI.SubTabUnderline
+                local glow  = GUI.SubTabGlow
+                local function rebuild() CreateContent() end
+                if under then
+                    local fromIdx, toIdx = 1, 1
+                    for j, n in ipairs(SubTabDefs) do
+                        if n == oldName   then fromIdx = j end
+                        if n == clickName then toIdx   = j end
+                    end
+                    local fromZX  = wx + (fromIdx - 1) * tabW
+                    local toZX    = wx + (toIdx - 1) * tabW
+                    local lineY   = barY + barH - 2
+                    local token = newAnimToken()
+                    task.spawn(function()
+                        local steps = 10
+                        for k = 1, steps do
+                            if not isAnimCurrent(token) then return end
+                            local t = k / steps
+                            local et = 1 - (1 - t) ^ 3
+                            local zx = fromZX + (toZX - fromZX) * et
+                            pcall(function()
+                                under.From = Vector2.new(zx + 1, lineY)
+                                under.To   = Vector2.new(zx + tabW - 1, lineY)
+                            end)
+                            if glow then
+                                pcall(function() glow.Position = Vector2.new(zx, barY) end)
+                            end
+                            task.wait(0.018)
+                        end
+                        rebuild()
+                    end)
+                else
+                    rebuild()
+                end
+            end,
+        })
+    end
+end
+
+-- ============================================================
+-- PAGE RENDERS
+-- ============================================================
+
+local function contentTopFor(page)
+    local base = Config.WinY + Config.HeaderH + Config.TabStripH + Config.ContentPad
+    if page == "Main" then base = base + Config.SubTabH end
+    return base
+end
+
+-- Helper: tiny bind pill next to a feature toggle (like Bridger's
+-- AutoFish hotkey pill).
+local function drawHotkeyPill(cardX, cardW, fY, currentVK, listenId, zb)
+    local togX = cardX + cardW - Config.CardPad - Config.ToggleW
+    local bw, bh = 32, 16
+    local bx = togX - bw - 16
+    local by = fY + 1
+    local isListening = (ListeningForBind == listenId)
+
+    local mbg = Drawing.new("Square")
+    mbg.Position = Vector2.new(bx, by); mbg.Size = Vector2.new(bw, bh)
+    mbg.Color = isListening and Colors.AccentRed or Colors.ToggleOff
+    mbg.Filled = true; mbg.Corner = 4
+    mbg.Visible = true; mbg.ZIndex = zb + 3
+    table.insert(GUI.ContentElements, mbg)
+
+    local mtxt = Drawing.new("Text")
+    mtxt.Position = Vector2.new(bx + bw / 2, by + 6)
+    mtxt.Text = isListening and "..." or getKeyName(currentVK)
+    mtxt.Color = Colors.TextPrimary; mtxt.Size = 11
+    mtxt.Font = Drawing.Fonts.SystemBold
+    mtxt.Center = true; mtxt.Outline = false
+    mtxt.Visible = true; mtxt.ZIndex = zb + 5
+    table.insert(GUI.ContentElements, mtxt)
+
+    table.insert(GUI.Clickables, {
+        x = bx, y = by, w = bw, h = bh,
+        hover = { el = mbg, base = mbg.Color },
+        onClick = function()
+            ListeningForBind = listenId
+            CreateContent()
+        end,
+    })
+end
+
+local function PageAutomation(zb, cardX, cardW)
+    local contentTopY = contentTopFor("Main")
+    local leftX, rightX, colW = splitCols(cardX, cardW)
+
+    -- LEFT: Features (5 toggles)
+    local featuresH = 52 + 5 * Config.RowHeight + 14
+    local fY = DrawCard(leftX, contentTopY, colW, featuresH, "Features", zb)
+
+    DrawCardToggleRow(leftX, colW, fY, "Hitbox Expander",
+        Features.HitboxExpander, Colors.HitboxColor, zb, function()
+            setHitboxOn(not Features.HitboxExpander)
+        end)
+    drawHotkeyPill(leftX, colW, fY, HitboxKey, "hitbox", zb)
+
+    DrawCardToggleRow(leftX, colW, fY + Config.RowHeight, "Visualizer",
+        Features.Visualizer, Colors.QTEColor, zb, function()
+            Features.Visualizer = not Features.Visualizer
+            if not Features.Visualizer then hideAllVisualizerLines() end
+            CreateContent()
+        end)
+
+    DrawCardToggleRow(leftX, colW, fY + 2 * Config.RowHeight, "Auto Kill",
+        Features.AutoKill, Colors.KillColor, zb, function()
+            setAutoKillOn(not Features.AutoKill)
+        end)
+    drawHotkeyPill(leftX, colW, fY + 2 * Config.RowHeight, AutoKillKey, "autokill", zb)
+
+    DrawCardToggleRow(leftX, colW, fY + 3 * Config.RowHeight, "Auto Retry",
+        Features.AutoRetry, Colors.AccentRed, zb, function()
+            Features.AutoRetry = not Features.AutoRetry
+            CreateContent()
+        end)
+
+    DrawCardToggleRow(leftX, colW, fY + 4 * Config.RowHeight, "Auto QTE Escape",
+        Features.AutoQTE, Colors.QTEColor, zb, function()
+            Features.AutoQTE = not Features.AutoQTE
+            CreateContent()
+        end)
+
+    -- LEFT bottom: Tuning (Hitbox Size slider — only knob left)
+    local tuningTopY = contentTopY + featuresH + 14
+    local tuningH = 100
+    local tY = DrawCard(leftX, tuningTopY, colW, tuningH, "Tuning", zb)
+
+    local sliderX = leftX + Config.CardPad
+    local sliderW = colW - 2 * Config.CardPad
+
+    local afterSize = DrawSlider(sliderX, tY, sliderW,
+        "Hitbox Size", HitboxSize, 10, 1000, "%d",
+        function(v) HitboxSize = math.floor(v + 0.5) end, zb,
+        "Cube size (in studs) applied to every titan's nape.\n" ..
+        "Larger = easier to hit but more visually obvious.\n" ..
+        "Default: 200")
+
+    local sizeNote = Drawing.new("Text")
+    sizeNote.Position = Vector2.new(sliderX, afterSize)
+    sizeNote.Text = "Default: 200"
+    sizeNote.Color = Colors.TextMuted
+    sizeNote.Size = 11; sizeNote.Font = Drawing.Fonts.System
+    sizeNote.Center = false; sizeNote.Outline = false
+    sizeNote.Visible = true; sizeNote.ZIndex = zb + 5
+    table.insert(GUI.ContentElements, sizeNote)
+
+    -- RIGHT: Stats (Titans Detected, Hitbox Size, Killed, Uptime)
+    local statsH = 52 + 4 * 30 + 10
+    local sY = DrawCard(rightX, contentTopY, colW, statsH, "Stats", zb)
+
+    GUI.TitansVal     = DrawStatRow(rightX, colW, sY,        "Titans Detected", 0, zb)
+    GUI.HitboxSizeVal = DrawStatRow(rightX, colW, sY + 30,   "Hitbox Size",     HitboxSize, zb)
+    GUI.KillsVal      = DrawStatRow(rightX, colW, sY + 60,   "Titans Killed",   Stats.TitansKilled, zb)
+    GUI.UptimeVal     = DrawStatRow(rightX, colW, sY + 90,   "Uptime",          "00:00", zb)
+end
+
+
+local function PageRaid(zb, cardX, cardW)
+    local contentTopY = contentTopFor("Raid")
+    local leftX, rightX, colW = splitCols(cardX, cardW)
+
+    -- LEFT: Eren Raid — runs the AutoKill drop pattern but targets
+    -- whichever live titan is closest to BigRock. Switches target on
+    -- the fly if a closer one spawns.
+    local erenH = 52 + 1 * Config.RowHeight + 14
+    local eY = DrawCard(leftX, contentTopY, colW, erenH, "Eren Raid", zb)
+    DrawCardToggleRow(leftX, colW, eY, "Eren Raid",
+        Features.ErenRaid, Colors.KillColor, zb, function()
+            Features.ErenRaid = not Features.ErenRaid
+            CreateContent()
+        end)
+
+    -- RIGHT: still a stub for future raid features.
+    local rightCard = {
+        title = "Placeholder B",
+        rows  = { { label = "Slot 3", key = "Slot3" }, { label = "Slot 4", key = "Slot4" } },
+    }
+    local h = 52 + #rightCard.rows * Config.RowHeight + 14
+    local rY = DrawCard(rightX, contentTopY, colW, h, rightCard.title, zb)
+    for i, row in ipairs(rightCard.rows) do
+        local key = row.key
+        DrawCardToggleRow(rightX, colW, rY + (i - 1) * Config.RowHeight, row.label,
+            RaidFlags[key], Colors.AccentRed, zb, function()
+                RaidFlags[key] = not RaidFlags[key]
+                CreateContent()
+            end)
+    end
+end
+
+local function PageSettings(zb, cardX, cardW)
+    local contentTopY = contentTopFor("Settings")
+
+    local cardW2 = cardW / 2 - Config.ColGap / 2
+    local cardX2 = cardX + (cardW - cardW2) / 2
+
+    -- Controls card: just the GUI Toggle key now (Hitbox/AutoKill
+    -- hotkeys are rebound from the pill next to their toggle on the
+    -- Automation page).
+    local controlsH = 52 + 1 * Config.RowHeight + 14
+    local controlsY = DrawCard(cardX2, contentTopY, cardW2, controlsH, "Controls", zb)
+
+    local lx = cardX2 + Config.CardPad
+    local rightEdge = cardX2 + cardW2 - Config.CardPad
+
+    local lblT = Drawing.new("Text")
+    lblT.Position = Vector2.new(lx, controlsY + 6)
+    lblT.Text = "Toggle Key"
+    lblT.Color = Colors.TextPrimary
+    lblT.Size = 14; lblT.Font = Drawing.Fonts.System
+    lblT.Visible = true; lblT.ZIndex = zb + 5
+    table.insert(GUI.ContentElements, lblT)
+
+    DrawBindButton(rightEdge - 80, controlsY + 1, GUI.ToggleKey,
+        GUI.ListeningForKey, zb, function()
+            GUI.ListeningForKey = not GUI.ListeningForKey
+            CreateContent()
+        end)
+
+    -- Config card: Save / Load
+    local configTopY = contentTopY + controlsH + 14
+    local configH    = 52 + 1 * Config.RowHeight + 14
+    local configY    = DrawCard(cardX2, configTopY, cardW2, configH, "Config", zb)
+
+    local cBtnW, cBtnH = 100, 26
+    local cBtnGap = 14
+    local cTotalW = cBtnW * 2 + cBtnGap
+    local cRowX = cardX2 + (cardW2 - cTotalW) / 2
+    local cRowY = configY + 5
+
+    DrawSmallButton(cRowX, cRowY, cBtnW, cBtnH, "Save Config",
+        Colors.ToggleOn, zb, function()
+            saveConfig()
+            notify("Config saved to RoxAOTR.json", "AOT:R", 2)
+        end, 6)
+
+    DrawSmallButton(cRowX + cBtnW + cBtnGap, cRowY, cBtnW, cBtnH, "Load Config",
+        Colors.AccentRed, zb, function()
+            loadConfig()
+            notify("Config loaded from RoxAOTR.json", "AOT:R", 2)
+            CreateContent()
+            if GUI.HintText then
+                pcall(function()
+                    GUI.HintText.Text = getKeyName(GUI.ToggleKey) .. " Toggle | End Unload"
+                end)
+            end
+        end, 6)
+end
+
+CreateContent = function()
+    ClearContent()
+    local zb = 13
+    local cardX = Config.WinX + Config.ContentPad
+    local cardW = Config.WinW - Config.ContentPad * 2
+
+    CreateSubTabs()
+
+    if GUI.SelectedPage == "Main" then
+        PageAutomation(zb, cardX, cardW)
+    elseif GUI.SelectedPage == "Raid" then
+        PageRaid(zb, cardX, cardW)
+    elseif GUI.SelectedPage == "Settings" then
+        PageSettings(zb, cardX, cardW)
+    end
+end
+
+-- Live-update stats without rebuilding the page.
+local function FormatUptime(seconds)
+    seconds = math.floor(seconds)
+    local h = math.floor(seconds / 3600)
+    local m = math.floor((seconds % 3600) / 60)
+    local s = seconds % 60
+    if h > 0 then return string.format("%02d:%02d:%02d", h, m, s) end
+    return string.format("%02d:%02d", m, s)
+end
+
+local function getTitanCount()
+    local count = 0
+    local titansFolder = Workspace:FindFirstChild("Titans")
+    if titansFolder then
+        for _ in ipairs(titansFolder:GetChildren()) do count = count + 1 end
+    end
+    return count
+end
+
+local function UpdateStatsLive()
+    pcall(function()
+        local rightEdge = Config.WinX + Config.WinW - Config.ContentPad - Config.CardPad
+        if GUI.TitansVal then
+            local txt = tostring(getTitanCount())
+            GUI.TitansVal.Text = txt
+            GUI.TitansVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.TitansVal.Position.Y)
+        end
+        if GUI.HitboxSizeVal then
+            local txt = tostring(HitboxSize)
+            GUI.HitboxSizeVal.Text = txt
+            GUI.HitboxSizeVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.HitboxSizeVal.Position.Y)
+        end
+        if GUI.KillsVal then
+            local txt = tostring(Stats.TitansKilled)
+            GUI.KillsVal.Text = txt
+            GUI.KillsVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.KillsVal.Position.Y)
+        end
+        if GUI.UptimeVal then
+            local txt = FormatUptime(getUptimeSeconds(killUptime))
+            GUI.UptimeVal.Text = txt
+            GUI.UptimeVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.UptimeVal.Position.Y)
+        end
+    end)
+end
+
+-- ============================================================
+-- MINI STATS PANEL — shown when a farm is on
+-- ============================================================
+
+local function getViewportSize()
+    local cam = Workspace and Workspace.CurrentCamera
+    if cam then
+        local ok, vp = pcall(function() return cam.ViewportSize end)
+        if ok and vp and vp.X and vp.X > 0 then return vp.X, vp.Y end
+    end
+    return 1920, 1080
+end
+
+local MINI_W = 280
+local MINI_ROW_H = 22
+local MINI_HEADER_H = 28
+
+local function clearMiniPanel()
+    for _, el in ipairs(GUI.MiniElements) do
+        pcall(function() el:Remove() end)
+    end
+    GUI.MiniElements = {}
+    GUI.MiniLiveElements = {}
+    GUI.MiniTitansVal = nil
+    GUI.MiniSizeVal   = nil
+    GUI.MiniKilledVal = nil
+    GUI.MiniUptimeVal = nil
+end
+
+local function buildMiniPanel()
+    clearMiniPanel()
+    local rows = {}
+    if Features.HitboxExpander then
+        table.insert(rows, { label = "Titans",      key = "titans" })
+        table.insert(rows, { label = "Hitbox Size", key = "size"   })
+    end
+    if Features.AutoKill then
+        if not Features.HitboxExpander then
+            table.insert(rows, { label = "Titans", key = "titans" })
+        end
+        table.insert(rows, { label = "Killed", key = "killed" })
+        table.insert(rows, { label = "Uptime", key = "uptime" })
+    end
+    if #rows == 0 then return end
+
+    local vpW, _ = getViewportSize()
+    local noteH = 18
+    local h = MINI_HEADER_H + #rows * MINI_ROW_H + noteH + 10
+    local x = math.floor((vpW - MINI_W) / 2)
+    local y = 20
+    local z = 80
+
+    local bg = Drawing.new("Square")
+    bg.Position = Vector2.new(x, y); bg.Size = Vector2.new(MINI_W, h)
+    bg.Color = Colors.HeaderInfoBg; bg.Filled = true; bg.Corner = 6
+    bg.Transparency = 0.55
+    bg.Visible = true; bg.ZIndex = z
+    table.insert(GUI.MiniElements, bg)
+
+    local border = Drawing.new("Square")
+    border.Position = Vector2.new(x, y); border.Size = Vector2.new(MINI_W, h)
+    border.Color = Colors.AccentRed; border.Filled = false
+    border.Thickness = 1; border.Corner = 6
+    border.Visible = true; border.ZIndex = z + 1
+    table.insert(GUI.MiniElements, border)
+
+    local title = Drawing.new("Text")
+    title.Position = Vector2.new(x + 12, y + 8)
+    title.Text = "Stats"
+    title.Color = Colors.AccentRed
+    title.Size = 14; title.Font = Drawing.Fonts.SystemBold
+    title.Center = false; title.Outline = false
+    title.Visible = true; title.ZIndex = z + 2
+    table.insert(GUI.MiniElements, title)
+
+    local underline = Drawing.new("Line")
+    underline.From = Vector2.new(x + 1, y + MINI_HEADER_H)
+    underline.To   = Vector2.new(x + MINI_W - 1, y + MINI_HEADER_H)
+    underline.Color = Colors.AccentRed; underline.Thickness = 1
+    underline.Visible = true; underline.ZIndex = z + 2
+    table.insert(GUI.MiniElements, underline)
+
+    local rightEdge = x + MINI_W - 14
+    for i, row in ipairs(rows) do
+        local rowY = y + MINI_HEADER_H + 6 + (i - 1) * MINI_ROW_H
+
+        local lbl = Drawing.new("Text")
+        lbl.Position = Vector2.new(x + 14, rowY)
+        lbl.Text = row.label; lbl.Color = Colors.TextMuted
+        lbl.Size = 13; lbl.Font = Drawing.Fonts.System
+        lbl.Center = false; lbl.Outline = false
+        lbl.Visible = true; lbl.ZIndex = z + 2
+        table.insert(GUI.MiniElements, lbl)
+
+        local val = Drawing.new("Text")
+        val.Text = "0"
+        val.Color = Colors.TextPrimary
+        val.Size = 14; val.Font = Drawing.Fonts.SystemBold
+        val.Center = false; val.Outline = false
+        val.Visible = true; val.ZIndex = z + 2
+        local estW = #val.Text * 8
+        val.Position = Vector2.new(rightEdge - estW, rowY - 1)
+        table.insert(GUI.MiniElements, val)
+        table.insert(GUI.MiniLiveElements, val)
+
+        if     row.key == "titans" then GUI.MiniTitansVal = val
+        elseif row.key == "size"   then GUI.MiniSizeVal   = val
+        elseif row.key == "killed" then GUI.MiniKilledVal = val
+        elseif row.key == "uptime" then GUI.MiniUptimeVal = val
+        end
+    end
+
+    -- Footer: "[KEY] to Stop". Both binds shown if both farms are on.
+    local hintParts = {}
+    if Features.HitboxExpander then
+        table.insert(hintParts, "[" .. getKeyName(HitboxKey) .. "] Hitbox")
+    end
+    if Features.AutoKill then
+        table.insert(hintParts, "[" .. getKeyName(AutoKillKey) .. "] Kill")
+    end
+    local hintTxt = table.concat(hintParts, "  ")
+
+    local noteY = y + MINI_HEADER_H + 6 + #rows * MINI_ROW_H + 4
+    local note = Drawing.new("Text")
+    note.Position = Vector2.new(x + MINI_W / 2, noteY)
+    note.Text = hintTxt
+    note.Color = Colors.TextMuted
+    note.Size = 12; note.Font = Drawing.Fonts.System
+    note.Center = true; note.Outline = false
+    note.Visible = true; note.ZIndex = z + 2
+    table.insert(GUI.MiniElements, note)
+end
+
+local function setMiniVal(el, txt)
+    if not el then return end
+    pcall(function()
+        el.Text = txt
+        local vpW, _ = getViewportSize()
+        local x = math.floor((vpW - MINI_W) / 2)
+        local rightEdge = x + MINI_W - 14
+        el.Position = Vector2.new(rightEdge - #txt * 8, el.Position.Y)
+    end)
+end
+
+local function updateMiniStatsLive()
+    if not GUI.Minimized then return end
+    if GUI.MiniTitansVal then setMiniVal(GUI.MiniTitansVal, tostring(getTitanCount())) end
+    if GUI.MiniSizeVal   then setMiniVal(GUI.MiniSizeVal,   tostring(HitboxSize)) end
+    if GUI.MiniKilledVal then setMiniVal(GUI.MiniKilledVal, tostring(Stats.TitansKilled)) end
+    if GUI.MiniUptimeVal then setMiniVal(GUI.MiniUptimeVal, FormatUptime(getUptimeSeconds(killUptime))) end
+end
+
+applyMinimizedState = function()
+    if GUI.Minimized then
+        for _, el in ipairs(GUI.Elements)        do pcall(function() el.Visible = false end) end
+        for _, el in ipairs(GUI.NavElements)     do pcall(function() el.Visible = false end) end
+        for _, el in ipairs(GUI.SubTabElements)  do pcall(function() el.Visible = false end) end
+        ClearContent()
+        buildMiniPanel()
+    else
+        clearMiniPanel()
+        if GUI.Visible then
+            for _, el in ipairs(GUI.Elements)    do pcall(function() el.Visible = true end) end
+            for _, el in ipairs(GUI.NavElements) do pcall(function() el.Visible = true end) end
+            CreateContent()
+        end
+    end
+end
+
+setHitboxOn = function(on)
+    if Features.HitboxExpander == on then return end
+    Features.HitboxExpander = on
+    if not on then restoreTitans() end
+    if GUI.Visible then CreateContent() end
+end
+
+setAutoKillOn = function(on)
+    if Features.AutoKill == on then return end
+    Features.AutoKill = on
+    syncKillUptime()
+    if GUI.Visible then CreateContent() end
+end
+
+-- ============================================================
+-- SNAKE BORDER
+-- ============================================================
+
+local rainbowSegs = {}
+
+local function buildRainbowBorder()
+    rainbowSegs = {}
+    local wx, wy = Config.WinX, Config.WinY
+    local ww, wh = Config.WinW, Config.WinH
+    local thickness = 2
+    local nTop, nRight, nBot, nLeft = 36, 24, 36, 24
+    local total = nTop + nRight + nBot + nLeft
+
+    local idx = 0
+    local function addSeg(x, y, w, h)
+        local s = Drawing.new("Square")
+        s.Position = Vector2.new(x, y); s.Size = Vector2.new(w, h)
+        s.Color = Color3.fromHSV(idx / total, 0.9, 1)
+        s.Filled = true; s.Visible = false; s.ZIndex = 20
+        table.insert(GUI.Elements, s)
+        table.insert(rainbowSegs, { sq = s, perim = idx / total })
+        idx = idx + 1
+    end
+
+    local segW = ww / nTop
+    for i = 1, nTop do addSeg(wx + (i - 1) * segW, wy, segW + 0.5, thickness) end
+    local segH = wh / nRight
+    for i = 1, nRight do addSeg(wx + ww - thickness, wy + (i - 1) * segH, thickness, segH + 0.5) end
+    for i = 1, nBot do addSeg(wx + ww - i * segW, wy + wh - thickness, segW + 0.5, thickness) end
+    for i = 1, nLeft do addSeg(wx, wy + wh - i * segH, thickness, segH + 0.5) end
+end
+
+local SNAKE_FRAC, SNAKE_SPEED = 0.20, 0.16
+local SNAKE_HEAD_COLOR = Color3.fromRGB(140, 190, 255)
+local SNAKE_TAIL_COLOR = Color3.fromRGB(30, 45, 80)
+
+task.spawn(function()
+    while GUI.Running do
+        -- 20Hz instead of 40Hz. With 120 segments and Luraph's per-call
+        -- overhead, halving the tick rate roughly halves the constant
+        -- CPU cost without making the snake noticeably less smooth.
+        task.wait(0.05)
+        if GUI.Visible and not GUI.Minimized and #rainbowSegs > 0 then
+            local t = tick()
+            local headPos = (t * SNAKE_SPEED) % 1
+            for _, seg in ipairs(rainbowSegs) do
+                pcall(function()
+                    local d = (headPos - seg.perim) % 1
+                    if d <= SNAKE_FRAC then
+                        local snakeT = d / SNAKE_FRAC
+                        local fade = 1 - snakeT
+                        local et = fade * fade
+                        seg.sq.Color = lerpColor(SNAKE_TAIL_COLOR, SNAKE_HEAD_COLOR, et)
+                        seg.sq.Visible = true
+                    elseif seg.sq.Visible then
+                        seg.sq.Visible = false
+                    end
+                end)
+            end
+        end
+    end
+end)
+
+-- ============================================================
+-- INIT — header / footer / static frame
+-- ============================================================
+
+local function Init()
+    local wx, wy = Config.WinX, Config.WinY
+    local ww, wh = Config.WinW, Config.WinH
+
+    local bg = Drawing.new("Square")
+    bg.Position = Vector2.new(wx, wy); bg.Size = Vector2.new(ww, wh)
+    bg.Color = Colors.WindowBg; bg.Filled = true; bg.Corner = Config.Corner
+    bg.Transparency = 0.40
+    bg.Visible = true; bg.ZIndex = 1
+    table.insert(GUI.Elements, bg)
+
+    local header = Drawing.new("Square")
+    header.Position = Vector2.new(wx, wy); header.Size = Vector2.new(ww, Config.HeaderH)
+    header.Color = Colors.HeaderInfoBg; header.Filled = true; header.Corner = Config.Corner
+    header.Visible = true; header.ZIndex = 3
+    table.insert(GUI.Elements, header)
+
+    local headerFill = Drawing.new("Square")
+    headerFill.Position = Vector2.new(wx, wy + Config.HeaderH - 6)
+    headerFill.Size = Vector2.new(ww, 6)
+    headerFill.Color = Colors.HeaderInfoBg; headerFill.Filled = true
+    headerFill.Visible = true; headerFill.ZIndex = 3
+    table.insert(GUI.Elements, headerFill)
+
+    local headerSep = Drawing.new("Line")
+    headerSep.From = Vector2.new(wx, wy + Config.HeaderH)
+    headerSep.To   = Vector2.new(wx + ww, wy + Config.HeaderH)
+    headerSep.Color = Colors.Separator; headerSep.Thickness = 1
+    headerSep.Visible = true; headerSep.ZIndex = 5
+    table.insert(GUI.Elements, headerSep)
+
+    local title = Drawing.new("Text")
+    title.Position = Vector2.new(wx + 18, wy + 15)
+    title.Text = SCRIPT_NAME; title.Color = Colors.AccentRed
+    title.Size = 18; title.Font = Drawing.Fonts.SystemBold
+    title.Visible = true; title.ZIndex = 6
+    table.insert(GUI.Elements, title)
+
+    local tagline = Drawing.new("Text")
+    tagline.Position = Vector2.new(wx + 18 + #SCRIPT_NAME * 8.3 + 4, wy + 18)
+    tagline.Text = SCRIPT_TAGLINE; tagline.Color = Colors.TextMuted
+    tagline.Size = 14; tagline.Font = Drawing.Fonts.System
+    tagline.Visible = true; tagline.ZIndex = 6
+    table.insert(GUI.Elements, tagline)
+
+    local statusPillW, versPillW, pillH = 70, 50, 26
+    local pillY = wy + (Config.HeaderH - pillH) / 2
+    local statusPillX = wx + ww - statusPillW - 12
+    local versPillX = statusPillX - 8 - versPillW
+
+    local versBg = Drawing.new("Square")
+    versBg.Position = Vector2.new(versPillX, pillY); versBg.Size = Vector2.new(versPillW, pillH)
+    versBg.Color = Colors.HeaderBg; versBg.Filled = true; versBg.Corner = 13
+    versBg.Visible = true; versBg.ZIndex = 6
+    table.insert(GUI.Elements, versBg)
+
+    local versText = Drawing.new("Text")
+    versText.Position = Vector2.new(versPillX + versPillW / 2, pillY + 13)
+    versText.Text = SCRIPT_VERSION; versText.Color = Colors.TextPrimary
+    versText.Size = 13; versText.Font = Drawing.Fonts.SystemBold
+    versText.Center = true
+    versText.Visible = true; versText.ZIndex = 7
+    table.insert(GUI.Elements, versText)
+
+    local statusBg = Drawing.new("Square")
+    statusBg.Position = Vector2.new(statusPillX, pillY); statusBg.Size = Vector2.new(statusPillW, pillH)
+    statusBg.Color = Colors.HeaderBg; statusBg.Filled = true; statusBg.Corner = 13
+    statusBg.Visible = true; statusBg.ZIndex = 6
+    table.insert(GUI.Elements, statusBg)
+
+    local statusDot = Drawing.new("Circle")
+    statusDot.Position = Vector2.new(statusPillX + 12, pillY + pillH / 2)
+    statusDot.Radius = 4; statusDot.Color = Colors.StatusOff
+    statusDot.Filled = true; statusDot.NumSides = 12
+    statusDot.Visible = true; statusDot.ZIndex = 7
+    table.insert(GUI.Elements, statusDot)
+    GUI.StatusDot = statusDot
+
+    local statusLabel = Drawing.new("Text")
+    statusLabel.Position = Vector2.new(statusPillX + 26, pillY + 6)
+    statusLabel.Text = "Idle"; statusLabel.Color = Colors.TextPrimary
+    statusLabel.Size = 13; statusLabel.Font = Drawing.Fonts.SystemBold
+    statusLabel.Visible = true; statusLabel.ZIndex = 7
+    table.insert(GUI.Elements, statusLabel)
+    GUI.StatusText = statusLabel
+
+    local footer = Drawing.new("Square")
+    footer.Position = Vector2.new(wx, wy + wh - Config.FooterH)
+    footer.Size = Vector2.new(ww, Config.FooterH)
+    footer.Color = Colors.FooterBg; footer.Filled = true; footer.Corner = Config.Corner
+    footer.Visible = true; footer.ZIndex = 3
+    table.insert(GUI.Elements, footer)
+
+    local footerFill = Drawing.new("Square")
+    footerFill.Position = Vector2.new(wx, wy + wh - Config.FooterH)
+    footerFill.Size = Vector2.new(ww, 6)
+    footerFill.Color = Colors.FooterBg; footerFill.Filled = true
+    footerFill.Visible = true; footerFill.ZIndex = 3
+    table.insert(GUI.Elements, footerFill)
+
+    local footerSep = Drawing.new("Line")
+    footerSep.From = Vector2.new(wx, wy + wh - Config.FooterH)
+    footerSep.To   = Vector2.new(wx + ww, wy + wh - Config.FooterH)
+    footerSep.Color = Colors.Separator; footerSep.Thickness = 1
+    footerSep.Visible = true; footerSep.ZIndex = 5
+    table.insert(GUI.Elements, footerSep)
+
+    local footerDot = Drawing.new("Circle")
+    footerDot.Position = Vector2.new(wx + 14, wy + wh - Config.FooterH / 2)
+    footerDot.Radius = 4; footerDot.Color = Colors.StatusOn
+    footerDot.Filled = true; footerDot.NumSides = 10
+    footerDot.Visible = true; footerDot.ZIndex = 6
+    table.insert(GUI.Elements, footerDot)
+
+    local footerVersion = Drawing.new("Text")
+    footerVersion.Position = Vector2.new(wx + 24, wy + wh - Config.FooterH + 7)
+    footerVersion.Text = "Made by Rox."; footerVersion.Color = Colors.TextMuted
+    footerVersion.Size = 14; footerVersion.Font = Drawing.Fonts.System
+    footerVersion.Visible = true; footerVersion.ZIndex = 6
+    table.insert(GUI.Elements, footerVersion)
+
+    GUI.HintText = Drawing.new("Text")
+    GUI.HintText.Position = Vector2.new(wx + ww - 120, wy + wh - Config.FooterH + 7)
+    GUI.HintText.Text = getKeyName(GUI.ToggleKey) .. " Toggle | End Unload"
+    GUI.HintText.Color = Colors.TextMuted
+    GUI.HintText.Size = 12; GUI.HintText.Font = Drawing.Fonts.System
+    GUI.HintText.Visible = true; GUI.HintText.ZIndex = 6
+    table.insert(GUI.Elements, GUI.HintText)
+
+    CreateMainTabs()
+    CreateContent()
+    buildRainbowBorder()
+end
+
+-- ============================================================
+-- MOVE WINDOW (drag header)
+-- ============================================================
+
+local function MoveWindow(dx, dy)
+    Config.WinX = Config.WinX + dx
+    Config.WinY = Config.WinY + dy
+
+    local function moveEl(el)
+        pcall(function()
+            if el.Position then el.Position = Vector2.new(el.Position.X + dx, el.Position.Y + dy) end
+        end)
+        pcall(function()
+            if el.From then el.From = Vector2.new(el.From.X + dx, el.From.Y + dy) end
+        end)
+        pcall(function()
+            if el.To then el.To = Vector2.new(el.To.X + dx, el.To.Y + dy) end
+        end)
+    end
+
+    newAnimToken()
+
+    for _, el in ipairs(GUI.Elements)        do moveEl(el) end
+    for _, el in ipairs(GUI.NavElements)     do moveEl(el) end
+    for _, el in ipairs(GUI.SubTabElements)  do moveEl(el) end
+    for _, el in ipairs(GUI.ContentElements) do moveEl(el) end
+
+    for _, c in ipairs(GUI.NavClickables) do c.x = c.x + dx; c.y = c.y + dy end
+    for _, c in ipairs(GUI.Clickables)    do c.x = c.x + dx; c.y = c.y + dy end
+end
+
+-- ============================================================
+-- UNLOAD
+-- ============================================================
+
+UnloadScript = function()
+    GUI.Running = false
+    Features.HitboxExpander = false
+    Features.Visualizer     = false
+    Features.AutoKill       = false
+    Features.AutoQTE        = false
+    Features.AutoRetry      = false
+    Features.ErenRaid       = false
+    pcall(restoreTitans)
+    pcall(restoreAutoKillTitans)
+    for _, el in ipairs(GUI.Elements)        do pcall(function() el:Remove() end) end
+    for _, el in ipairs(GUI.NavElements)     do pcall(function() el:Remove() end) end
+    for _, el in ipairs(VisualizerLines)     do pcall(function() el:Remove() end) end
+    GUI.Elements = {}
+    GUI.NavElements = {}
+    GUI.NavClickables = {}
+    VisualizerLines = {}
+    ClearContent()
+    clearMiniPanel()
+    notify("AOT:R unloaded", "AOT:R", 3)
+end
+
+-- ============================================================
+-- BACKGROUND LOOPS
+-- ============================================================
+
+-- Hitbox enforce loop
+task.spawn(function()
+    while GUI.Running do
+        if Features.HitboxExpander then pcall(expandTitans) end
+        task.wait(RefreshRate)
+    end
+end)
+
+-- Visualizer render loop. Idles slowly when the feature is off so we
+-- don't burn coroutine time at 33Hz on a no-op every frame. Polls at
+-- ~20Hz when on, which is plenty for wireframe smoothness.
+task.spawn(function()
+    while GUI.Running do
+        if Features.Visualizer then
+            pcall(updateVisualizer)
+            task.wait(0.05)
+        else
+            task.wait(0.5)
+        end
+    end
+end)
+
+-- Auto Kill — self-contained farm using the drop+velocity pattern.
+--   - Auto-engages a smaller (AutoKillHitboxSize) nape expansion so
+--     the user doesn't need Hitbox Expander on separately.
+--   - Each cycle TPs the player to (nape + AutoKillDropHeight) but
+--     does NOT zero AssemblyLinearVelocity, so the downward velocity
+--     from the previous drop carries over and the player slams
+--     through the nape at increasing speed.
+--   - Floor check exits the dwell early once the player crosses
+--     (nape + AutoKillFloorBuffer), so they never reach nape level
+--     (which would trigger nape-grab).
+--   - Every AutoKillAnchorEvery cycles, the assembly's linear
+--     velocity is INSTANTLY zeroed (no hold) so the player can't
+--     run away with the speed buildup. Lower this knob if you're
+--     overshooting; raise it for harder slams.
+--   - Grab bailout: if the target titan has any "*grab*" attribute
+--     set true (Left_nape_grab / Right_air_grab / etc.), the loop
+--     TPs the player up high, zeroes velocity, and freezes for 0.5s.
+task.spawn(function()
+    local prevActive = false
+    local lastAttack = 0
+    local activeTitan, activeNape = nil, nil
+    local cycleCount = 0
+
+    local function applyHitbox()
+        local titansFolder = Workspace:FindFirstChild("Titans")
+        if not titansFolder then return end
+        local sizeVec = Vector3.new(AutoKillHitboxSize, AutoKillHitboxSize, AutoKillHitboxSize)
+        for _, titan in ipairs(titansFolder:GetChildren()) do
+            local nape = getNape(titan)
+            if nape then
+                local okAddr, addr = pcall(function() return nape.Address end)
+                if okAddr and addr and not AutoKillOriginalSizes[addr] then
+                    local okSz, sz = pcall(function() return nape.Size end)
+                    if okSz and sz then AutoKillOriginalSizes[addr] = sz end
+                end
+                writePartSize(nape, sizeVec)
+            end
+        end
+    end
+
+    while GUI.Running do
+        if Features.AutoKill or Features.ErenRaid then
+            prevActive = true
+
+            applyHitbox()
+
+            -- Target picker depends on mode. ErenRaid prioritises
+            -- the titan closest to the rock (so they never reach it)
+            -- and re-evaluates EVERY cycle — if a new titan spawns
+            -- closer to the rock, we hot-swap to it immediately.
+            -- Plain AutoKill takes whichever titan is nearest the
+            -- player and only swaps when the current one dies.
+            -- ErenRaid wins if both are on.
+            if Features.ErenRaid then
+                local newTitan, newNape = getNearestLiveTitanToRock()
+                if newTitan ~= activeTitan then
+                    activeTitan, activeNape = newTitan, newNape
+                    cycleCount = 0
+                end
+            elseif not (activeTitan and findHumanoid(activeTitan)) then
+                activeTitan, activeNape = getNearestLiveTitan()
+                cycleCount = 0
+            end
+
+            if activeTitan and activeNape then
+                local hrp = getHRP()
+                local okN, npos = pcall(function() return activeNape.Position end)
+                if hrp and okN and npos then
+                    -- Grab bailout. If any "*grab*" attribute on the
+                    -- target titan is set, TP up high, zero velocity,
+                    -- and freeze 0.5s so we don't get held.
+                    if isTitanGrabbing(activeTitan) then
+                        pcall(function()
+                            hrp.CFrame = CFrame.new(npos.X, npos.Y + AutoKillDropHeight + 60, npos.Z)
+                        end)
+                        pcall(function() hrp.AssemblyLinearVelocity = Vector3.zero end)
+                        pcall(function() hrp.Velocity = Vector3.zero end)
+                        task.wait(0.5)
+                        cycleCount = 0
+                    else
+                        -- Standard cycle: TP up, leave velocity alone.
+                        pcall(function()
+                            hrp.CFrame = CFrame.new(npos.X, npos.Y + AutoKillDropHeight, npos.Z)
+                        end)
+
+                        cycleCount = cycleCount + 1
+
+                        -- Periodic INSTANT velocity reset. Every Nth
+                        -- cycle, zero the assembly's linear velocity
+                        -- right after the TP-up — no hold loop. The
+                        -- next cycle starts from a clean 0, so the
+                        -- player only ever has at most N cycles' worth
+                        -- of accumulated speed.
+                        if cycleCount >= AutoKillAnchorEvery then
+                            cycleCount = 0
+                            pcall(function() hrp.AssemblyLinearVelocity = Vector3.zero end)
+                            pcall(function() hrp.Velocity = Vector3.zero end)
+                        end
+
+                        if tick() - lastAttack >= KillCooldown then
+                            performAttack()
+                            lastAttack = tick()
+                        end
+
+                        -- Dwell with floor-check.
+                        local floorY  = npos.Y + AutoKillFloorBuffer
+                        local dwellEnd = tick() + AutoKillDropDwell
+                        while tick() < dwellEnd do
+                            local h2 = getHRP()
+                            if not h2 then break end
+                            local okP, p = pcall(function() return h2.Position end)
+                            if okP and p and p.Y <= floorY then break end
+                            task.wait(0.015)
+                        end
+                    end
+                end
+            else
+                task.wait(0.3)
+            end
+        else
+            if prevActive then
+                restoreAutoKillTitans()
+                activeTitan, activeNape = nil, nil
+                cycleCount = 0
+                prevActive = false
+            end
+            task.wait(0.2)
+        end
+    end
+end)
+
+-- Auto QTE loop. AOT:R surfaces the active QTE prompt by spawning a
+-- child named after the required key (W/A/S/D) under
+-- PlayerGui.Interface.Buttons. Cycle all four per loop and press
+-- whichever exists — covers any prompt order.
+local QTE_VK = { W = 0x57, A = 0x41, S = 0x53, D = 0x44 }
+
+task.spawn(function()
+    while GUI.Running do
+        if Features.AutoQTE then
+            local buttons
+            pcall(function()
+                buttons = LocalPlayer.PlayerGui.Interface.Buttons
+            end)
+            if buttons then
+                for key, vk in pairs(QTE_VK) do
+                    local folder
+                    pcall(function() folder = buttons:FindFirstChild(key) end)
+                    if folder then
+                        pcall(keypress, vk)
+                        task.wait(0.2)
+                        pcall(keyrelease, vk)
+                    end
+                end
+            end
+            task.wait()
+        else
+            task.wait(0.2)
+        end
+    end
+end)
+
+-- Auto Retry — when "Mission Completed" comes up, drive Roblox's
+-- built-in GUI navigation to focus and activate the RETRY button.
+-- Matcha can't fire button signals or use absolute mouse coords
+-- reliably (Roblox windowed mode breaks mousemoveabs), but Roblox's
+-- own keyboard nav works:
+--   \         toggles GUI navigation mode (focus appears on a button)
+--   Right ×2  steps focus from default (Leave) → Modify → Retry
+--   Enter     activates the focused button
+-- We detect the Rewards screen by walking to its Buttons.Retry path
+-- (CanvasGroup root has no AbsoluteSize) and confirming the button
+-- has a non-zero AbsoluteSize.
+local VK_BACKSLASH = 0xDC   -- "\" / VK_OEM_5
+local VK_D         = 0x44   -- D key (replaces right-arrow for GUI nav step)
+local VK_ENTER     = 0x0D
+
+task.spawn(function()
+    local lastFire           = 0
+    local lastSawLiveTitan   = 0      -- tick() at which we last saw a Humanoid'd titan
+    local firedThisSession   = false  -- prevents re-firing while rewards is still up
+
+    -- The Rewards CanvasGroup is permanent in PlayerGui (just faded
+    -- in/out via GroupTransparency, which Matcha can't read), so an
+    -- existence check on Buttons.Retry is true 100% of the time.
+    -- Instead we use a behavioral signal: the rewards screen only
+    -- shows when the mission ends → just before that, there were
+    -- live titans, and now there aren't. Track when we last saw one.
+    local function retryButtonExists()
+        local pg     = LocalPlayer:FindFirstChild("PlayerGui")
+        local iface  = pg     and pg:FindFirstChild("Interface")
+        local rew    = iface  and iface:FindFirstChild("Rewards")
+        local mainA  = rew    and rew:FindFirstChild("Main")
+        local info   = mainA  and mainA:FindFirstChild("Info")
+        local mainB  = info   and info:FindFirstChild("Main")
+        local btns   = mainB  and mainB:FindFirstChild("Buttons")
+        local retry  = btns   and btns:FindFirstChild("Retry")
+        return retry ~= nil
+    end
+
+    local function anyLiveTitan()
+        local titans = Workspace:FindFirstChild("Titans")
+        if not titans then return false end
+        for _, t in ipairs(titans:GetChildren()) do
+            if findHumanoid(t) then return true end
+        end
+        return false
+    end
+
+    local function tap(vk)
+        pcall(keypress, vk)
+        task.wait(0.08)
+        pcall(keyrelease, vk)
+    end
+
+    while GUI.Running do
+        do
+            local hasTitan = anyLiveTitan()
+
+            if hasTitan then
+                lastSawLiveTitan = tick()
+                firedThisSession = false   -- new mission active, arm us again
+            end
+
+            -- Fire only when:
+            --   - it's been at least 3s since the last live titan was seen
+            --     (gives the rewards screen time to fully animate in and
+            --      the GUI nav system time to focus the default button)
+            --   - it's been at most 30s (sanity bound — long idle in the
+            --     rewards screen shouldn't keep retrying forever)
+            --   - the Retry path is present (rewards UI exists)
+            --   - we haven't already fired this session
+            --   - cooldown elapsed
+            local sinceTitan = tick() - lastSawLiveTitan
+            if (not hasTitan)
+               and sinceTitan >= 3.0
+               and sinceTitan < 30
+               and (not firedThisSession)
+               and (tick() - lastFire > 4.0)
+               and retryButtonExists() then
+                firedThisSession = true
+                lastFire = tick()
+
+                -- Re-inject after the sub-place transition. AOT:R's
+                -- retry teleports to a new sub-place, which spawns a
+                -- fresh Lua VM and kills our coroutines. Matcha's
+                -- autoexec only fires on the first game join, so it
+                -- won't re-run on sub-place hops. queue_on_teleport
+                -- queues code to run once the next teleport completes
+                -- — we point it at the on-disk copy of this script so
+                -- it reloads itself on the new map.
+                --
+                -- One-time setup the user has to do:
+                --   1. Save AOTR.lua to c:\matcha\workspace\AOTR\AOTR.lua
+                --   2. Put this in Matcha's auto-execute slot (for the
+                --      initial game join):
+                --        pcall(function()
+                --            loadstring(readfile("AOTR/AOTR.lua"))()
+                --        end)
+                pcall(function()
+                    if queue_on_teleport then
+                        queue_on_teleport([[
+                            pcall(function()
+                                if isfile and isfile("AOTR/AOTR.lua") then
+                                    loadstring(readfile("AOTR/AOTR.lua"))()
+                                end
+                            end)
+                        ]])
+                    end
+                end)
+
+                -- Sequence: \ engages GUI nav (focus lands on Leave),
+                -- two D presses step Leave → Modify → Retry, then
+                -- Enter activates. 1.5s gap between every press so
+                -- each input registers before the next.
+                tap(VK_BACKSLASH)
+                task.wait(0.3)
+                tap(VK_D)
+                task.wait(0.3)
+                tap(VK_D)
+                task.wait(0.3)
+                tap(VK_ENTER)
+            end
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- Kill counter — watches titan alive→dead transitions
+task.spawn(function()
+    local lastTitanState = {}
+    while GUI.Running do
+        task.wait(0.5)
+        if Features.AutoKill or Features.ErenRaid then
+            local folder = Workspace:FindFirstChild("Titans")
+            if folder then
+                local seen = {}
+                for _, titan in ipairs(folder:GetChildren()) do
+                    local okA, addr = pcall(function() return titan.Address end)
+                    if okA and addr then
+                        seen[addr] = true
+                        local alive = findHumanoid(titan) ~= nil
+                        if lastTitanState[addr] == true and not alive then
+                            Stats.TitansKilled = Stats.TitansKilled + 1
+                        end
+                        lastTitanState[addr] = alive
+                    end
+                end
+                for addr in pairs(lastTitanState) do
+                    if not seen[addr] then lastTitanState[addr] = nil end
+                end
+            end
+        end
+    end
+end)
+
+-- Status + live stats updater
+task.spawn(function()
+    while GUI.Running do
+        task.wait(0.5)
+        pcall(function()
+            if not GUI.StatusDot or not GUI.StatusText then return end
+            local active = Features.HitboxExpander or Features.Visualizer
+                or Features.AutoKill or Features.AutoQTE or Features.ErenRaid
+            GUI.StatusDot.Color = active and Colors.StatusOn or Colors.StatusOff
+            GUI.StatusText.Text = active and "Active" or "Idle"
+        end)
+        if GUI.Visible then
+            if GUI.Minimized then
+                updateMiniStatsLive()
+            else
+                UpdateStatsLive()
+            end
+        end
+    end
+end)
+
+-- ============================================================
+-- INPUT LOOP
+-- ============================================================
+
+local function sliderRising(vk)
+    local down = iskeypressed(vk)
+    local was  = GUI.SliderKeyState[vk]
+    GUI.SliderKeyState[vk] = down
+    return down and not was
+end
+
+local function InputLoop()
+    while GUI.Running do
+        repeat
+        -- Slider value-edit mode
+        if GUI.EditingSlider then
+            local valChanged = false
+            for vk = 0x30, 0x39 do
+                if sliderRising(vk) then
+                    GUI.SliderBuffer = GUI.SliderBuffer .. string.char(vk)
+                    valChanged = true
+                end
+            end
+            for vk = 0x60, 0x69 do
+                if sliderRising(vk) then
+                    GUI.SliderBuffer = GUI.SliderBuffer .. string.char(vk - 0x60 + 0x30)
+                    valChanged = true
+                end
+            end
+            if sliderRising(0xBE) or sliderRising(0x6E) then
+                if not GUI.SliderBuffer:find("%.", 1, true) then
+                    GUI.SliderBuffer = GUI.SliderBuffer .. "."
+                    valChanged = true
+                end
+            end
+            if sliderRising(0x08) then
+                GUI.SliderBuffer = string.sub(GUI.SliderBuffer, 1, -2)
+                valChanged = true
+            end
+            if sliderRising(0x0D) then
+                local num = tonumber(GUI.SliderBuffer)
+                if num and GUI.EditingSlider then
+                    num = math.max(GUI.EditingSlider.minV,
+                                   math.min(GUI.EditingSlider.maxV, num))
+                    GUI.EditingSlider.onChange(num)
+                end
+                GUI.EditingSlider = nil; GUI.SliderBuffer = ""; GUI.SliderKeyState = {}
+                if GUI.Visible and not GUI.Minimized then CreateContent() end
+            end
+            if GUI.EditingSlider and sliderRising(0x1B) then
+                GUI.EditingSlider = nil; GUI.SliderBuffer = ""; GUI.SliderKeyState = {}
+                if GUI.Visible and not GUI.Minimized then CreateContent() end
+            end
+            if valChanged and GUI.EditingSlider and GUI.EditingSlider.valTxt then
+                pcall(function()
+                    GUI.EditingSlider.valTxt.Text = GUI.SliderBuffer .. "_"
+                end)
+            end
+            if GUI.Visible then
+                local mx, my = Mouse.X, Mouse.Y
+                local mouseDown = ismouse1pressed()
+                local justPressed = mouseDown and not GUI.WasMouseDown
+                if justPressed then
+                    for _, c in ipairs(GUI.Clickables) do
+                        if IsInside(mx, my, c.x, c.y, c.w, c.h) then
+                            if c.hover and c.hover.el then pressEffect(c.hover.el) end
+                            c.onClick()
+                            break
+                        end
+                    end
+                end
+                GUI.WasMouseDown = mouseDown
+            else
+                GUI.WasMouseDown = false
+            end
+            break
+        end
+
+        -- Hitbox / AutoKill bind capture
+        if ListeningForBind == "hitbox" or ListeningForBind == "autokill" then
+            for vk = 0x08, 0xFE do
+                if vk ~= VK_END and iskeypressed(vk) then
+                    if ListeningForBind == "hitbox" then
+                        HitboxKey = vk
+                        GUI.WasHitboxKeyDown = true
+                    else
+                        AutoKillKey = vk
+                        GUI.WasAutoKillKeyDown = true
+                    end
+                    ListeningForBind = nil
+                    if GUI.Visible and not GUI.Minimized then CreateContent() end
+                    task.wait(0.3)
+                    break
+                end
+            end
+        end
+
+        -- Toggle / Debug key rebind capture
+        if GUI.ListeningForKey then
+            for vk = 0x08, 0xFE do
+                if vk ~= VK_END and iskeypressed(vk) then
+                    GUI.ToggleKey = vk
+                    GUI.ListeningForKey = false
+                    GUI.WasToggleDown = true
+                    if GUI.HintText then
+                        pcall(function()
+                            GUI.HintText.Text = getKeyName(vk) .. " Toggle | End Unload"
+                        end)
+                    end
+                    if GUI.Visible then CreateContent() end
+                    task.wait(0.3)
+                    break
+                end
+            end
+        end
+        -- Farm hotkeys (rising-edge)
+        if not ListeningForBind and not GUI.ListeningForKey then
+            local hbDown = iskeypressed(HitboxKey)
+            if hbDown and not GUI.WasHitboxKeyDown then
+                setHitboxOn(not Features.HitboxExpander)
+            end
+            GUI.WasHitboxKeyDown = hbDown
+
+            local akDown = iskeypressed(AutoKillKey)
+            if akDown and not GUI.WasAutoKillKeyDown then
+                setAutoKillOn(not Features.AutoKill)
+            end
+            GUI.WasAutoKillKeyDown = akDown
+        end
+
+        -- End → unload (with rising-edge guard)
+        local endDown = iskeypressed(VK_END)
+        if GUI.EndKeyReady then
+            if endDown and not GUI.WasEndDown then
+                UnloadScript()
+                return
+            end
+        else
+            if not endDown then GUI.EndKeyReady = true end
+        end
+        GUI.WasEndDown = endDown
+
+        -- Toggle GUI visibility
+        if not GUI.ListeningForKey then
+            local toggleDown = iskeypressed(GUI.ToggleKey)
+            if toggleDown and not GUI.WasToggleDown then
+                GUI.Visible = not GUI.Visible
+                if not GUI.Visible then
+                    for _, el in ipairs(GUI.Elements) do
+                        pcall(function() el.Visible = false end)
+                    end
+                    for _, el in ipairs(GUI.NavElements) do
+                        pcall(function() el.Visible = false end)
+                    end
+                    ClearContent()
+                    clearMiniPanel()
+                    clearTooltip()
+                else
+                    applyMinimizedState()
+                end
+            end
+            GUI.WasToggleDown = toggleDown
+        end
+
+        if GUI.Visible then
+            local mx, my = Mouse.X, Mouse.Y
+            local mouseDown = ismouse1pressed()
+            local justPressed = mouseDown and not GUI.WasMouseDown
+
+            if GUI.ActiveSlider then
+                if mouseDown then pcall(GUI.ActiveSlider) else GUI.ActiveSlider = nil end
+            end
+
+            local onHeader = IsInside(mx, my, Config.WinX, Config.WinY, Config.WinW, Config.HeaderH)
+
+            for _, c in ipairs(GUI.Clickables) do
+                local isOver = IsInside(mx, my, c.x, c.y, c.w, c.h)
+                if c.hover and c.hover.el then
+                    if isOver and not c.hover.hovered then
+                        pcall(function() c.hover.el.Color = lighten(c.hover.base, 0.10) end)
+                        if c.hover.glow then pcall(function() c.hover.glow.Visible = true end) end
+                        c.hover.hovered = true
+                    elseif (not isOver) and c.hover.hovered then
+                        pcall(function() c.hover.el.Color = c.hover.base end)
+                        if c.hover.glow then pcall(function() c.hover.glow.Visible = false end) end
+                        c.hover.hovered = false
+                    end
+                end
+                if c.tooltip then
+                    if isOver and not c.tooltipShown then
+                        showTooltip(c.tooltip, mx + 14, my + 14)
+                        c.tooltipShown = true
+                    elseif (not isOver) and c.tooltipShown then
+                        clearTooltip()
+                        c.tooltipShown = false
+                    end
+                end
+            end
+
+            if GUI.Dragging then
+                if mouseDown then
+                    local newX = mx - GUI.DragOffsetX
+                    local newY = my - GUI.DragOffsetY
+                    local ddx = newX - Config.WinX
+                    local ddy = newY - Config.WinY
+                    if ddx ~= 0 or ddy ~= 0 then MoveWindow(ddx, ddy) end
+                else
+                    GUI.Dragging = false
+                    CreateContent()
+                end
+            end
+
+            if justPressed then
+                local handled = false
+
+                for _, c in ipairs(GUI.NavClickables) do
+                    if IsInside(mx, my, c.x, c.y, c.w, c.h) then
+                        if c.hover and c.hover.el then pressEffect(c.hover.el) end
+                        c.onClick()
+                        handled = true
+                        break
+                    end
+                end
+
+                if not handled then
+                    for _, c in ipairs(GUI.Clickables) do
+                        if IsInside(mx, my, c.x, c.y, c.w, c.h) then
+                            if c.hover and c.hover.el then pressEffect(c.hover.el) end
+                            if c.sliderDrag then GUI.ActiveSlider = c.sliderDrag end
+                            c.onClick()
+                            handled = true
+                            break
+                        end
+                    end
+                end
+
+                if not handled and onHeader then
+                    GUI.Dragging = true
+                    GUI.DragOffsetX = mx - Config.WinX
+                    GUI.DragOffsetY = my - Config.WinY
+                end
+            end
+            GUI.WasMouseDown = mouseDown
+        else
+            GUI.WasMouseDown = false
+        end
+
+        until true
+        task.wait(0.016)
+    end
+end
+
+-- ============================================================
+-- BOOT
+-- ============================================================
+
+loadConfig()
+Init()
+task.spawn(InputLoop)
+notify("AOT:R loaded — " .. getKeyName(GUI.ToggleKey) .. " Toggle, End Unload",
+    "Rox's Menu", 4)
