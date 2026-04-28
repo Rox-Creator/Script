@@ -37,7 +37,14 @@ local Features = {
     ErenRaid       = false,   -- Eren Raid: AutoKill but targets titans
                               -- closest to BigRock first so they don't
                               -- damage Eren during Defend Eren.
+    AutoRefill     = false,   -- TP to nearest GasTanks.Refill, press
+                              -- E, wait 5s when blade-set count hits 0.
 }
+
+-- Set true while the Auto Refill loop is actively refilling, so the
+-- AutoKill loop stands down (no TPs / no slashes) and doesn't fight
+-- the player position during the refill animation.
+local RefillingNow = false
 
 local HitboxSize    = 1000
 local KillCooldown  = 0.35
@@ -84,6 +91,18 @@ local BoxEdges = {
 
 -- Stats
 local Stats = { TitansKilled = 0 }
+
+-- Lifetime / persistent stats. Lives in its own file so it survives
+-- config corruption / format changes. Updated in-memory on each event
+-- (kill, refill, retry, uptime tick) and flushed to disk every 30s
+-- by a background loop.
+local LifetimeStats = {
+    titansKilled = 0,
+    refills      = 0,
+    retries      = 0,
+    uptime       = 0,    -- seconds with any kill mode active
+}
+local LifetimeDirty = false   -- bumped on increment, cleared on save
 
 -- Uptime tracker for AutoKill (Bridger pattern).
 local killUptime = { total = 0, start = nil }
@@ -133,6 +152,34 @@ local function getKeyName(vk) return VK_NAMES[vk] or string.format("0x%02X", vk)
 
 local CONFIG_DIR  = "AOTR"
 local CONFIG_PATH = CONFIG_DIR .. "/RoxAOTR.json"
+local STATS_PATH  = CONFIG_DIR .. "/stats.json"
+
+local function loadLifetimeStats()
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then return end
+    if not isfile(STATS_PATH) then return end
+    local ok, raw = pcall(readfile, STATS_PATH)
+    if not (ok and raw) then return end
+    local okJ, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not (okJ and type(data) == "table") then return end
+    if type(data.titansKilled) == "number" then LifetimeStats.titansKilled = data.titansKilled end
+    if type(data.refills)      == "number" then LifetimeStats.refills      = data.refills      end
+    if type(data.retries)      == "number" then LifetimeStats.retries      = data.retries      end
+    if type(data.uptime)       == "number" then LifetimeStats.uptime       = data.uptime       end
+end
+
+local function saveLifetimeStats()
+    if type(writefile) ~= "function" then return end
+    LifetimeDirty = false
+    task.spawn(function()
+        pcall(function()
+            if type(makefolder) == "function" and type(isfolder) == "function"
+               and not isfolder(CONFIG_DIR) then
+                makefolder(CONFIG_DIR)
+            end
+            writefile(STATS_PATH, HttpService:JSONEncode(LifetimeStats))
+        end)
+    end)
+end
 
 -- saveConfig is only called from the explicit Save button on the
 -- Settings page. Toggles and sliders DO NOT auto-save anymore — that
@@ -156,6 +203,7 @@ local function saveConfig()
             AutoQTE        = Features.AutoQTE,
             AutoRetry      = Features.AutoRetry,
             ErenRaid       = Features.ErenRaid,
+            AutoRefill     = Features.AutoRefill,
         },
     }
     task.spawn(function()
@@ -192,6 +240,7 @@ local function loadConfig()
         if type(data.features.AutoQTE)        == "boolean" then Features.AutoQTE        = data.features.AutoQTE        end
         if type(data.features.AutoRetry)      == "boolean" then Features.AutoRetry      = data.features.AutoRetry      end
         if type(data.features.ErenRaid)       == "boolean" then Features.ErenRaid       = data.features.ErenRaid       end
+        if type(data.features.AutoRefill)     == "boolean" then Features.AutoRefill     = data.features.AutoRefill     end
         if (Features.AutoKill or Features.ErenRaid) and not killUptime.start then
             killUptime.start = tick()
         end
@@ -407,6 +456,60 @@ local function isTitanGrabbing(titan)
     return false
 end
 
+-- Reads the "X / Y" blade-sets counter from the HUD. Returns the
+-- remaining set count as a number, or nil if the label can't be read.
+-- Path: PlayerGui.Interface.HUD.Main.Top["7"].Blades.Sets
+local function getBladeSets()
+    local pg     = LocalPlayer:FindFirstChild("PlayerGui")
+    local iface  = pg     and pg:FindFirstChild("Interface")
+    local hud    = iface  and iface:FindFirstChild("HUD")
+    local main   = hud    and hud:FindFirstChild("Main")
+    local top    = main   and main:FindFirstChild("Top")
+    local seven  = top    and top:FindFirstChild("7")
+    local blades = seven  and seven:FindFirstChild("Blades")
+    local sets   = blades and blades:FindFirstChild("Sets")
+    if not sets then return nil end
+    local okT, txt = pcall(function() return sets.Text end)
+    if not (okT and type(txt) == "string") then return nil end
+    return tonumber(txt:match("(%d+)"))
+end
+
+-- Walks every "Refill" descendant in Workspace whose parent is a
+-- "GasTanks" model and returns the one nearest the player. Covers
+-- gas tanks anywhere on the map, not just the wall-mounted ones.
+local function getNearestRefill()
+    local hrp = getHRP()
+    if not hrp then return nil end
+    local okP, pPos = pcall(function() return hrp.Position end)
+    if not (okP and pPos) then return nil end
+
+    local descs
+    pcall(function() descs = Workspace:GetDescendants() end)
+    if not descs then return nil end
+
+    local bestPart, bestD2 = nil, math.huge
+    for _, d in ipairs(descs) do
+        local okN, name = pcall(function() return d.Name end)
+        if okN and name == "Refill" then
+            local par
+            pcall(function() par = d.Parent end)
+            local parName
+            if par then pcall(function() parName = par.Name end) end
+            if parName == "GasTanks" then
+                local okR, rPos = pcall(function() return d.Position end)
+                if okR and rPos then
+                    local dx = pPos.X - rPos.X
+                    local dy = pPos.Y - rPos.Y
+                    local dz = pPos.Z - rPos.Z
+                    local d2 = dx*dx + dy*dy + dz*dz
+                    if d2 < bestD2 then bestD2 = d2; bestPart = d end
+                end
+            end
+        end
+    end
+    return bestPart
+end
+
 local function getOrCreateLine(idx)
     local ln = VisualizerLines[idx]
     if ln then return ln end
@@ -536,6 +639,10 @@ GUI.TitansVal        = nil
 GUI.HitboxSizeVal    = nil
 GUI.KillsVal         = nil
 GUI.UptimeVal        = nil
+GUI.LifeKillsVal     = nil
+GUI.LifeRefillsVal   = nil
+GUI.LifeRetriesVal   = nil
+GUI.LifeUptimeVal    = nil
 
 local VK_END = 0x23
 
@@ -756,6 +863,10 @@ ClearContent = function()
     GUI.HitboxSizeVal   = nil
     GUI.KillsVal        = nil
     GUI.UptimeVal       = nil
+    GUI.LifeKillsVal    = nil
+    GUI.LifeRefillsVal  = nil
+    GUI.LifeRetriesVal  = nil
+    GUI.LifeUptimeVal   = nil
 end
 
 local function DrawCard(x, y, w, h, title, zbase)
@@ -1325,8 +1436,8 @@ local function PageAutomation(zb, cardX, cardW)
     local contentTopY = contentTopFor("Main")
     local leftX, rightX, colW = splitCols(cardX, cardW)
 
-    -- LEFT: Features (5 toggles)
-    local featuresH = 52 + 5 * Config.RowHeight + 14
+    -- LEFT: Features (6 toggles)
+    local featuresH = 52 + 6 * Config.RowHeight + 14
     local fY = DrawCard(leftX, contentTopY, colW, featuresH, "Features", zb)
 
     DrawCardToggleRow(leftX, colW, fY, "Hitbox Expander",
@@ -1348,13 +1459,19 @@ local function PageAutomation(zb, cardX, cardW)
         end)
     drawHotkeyPill(leftX, colW, fY + 2 * Config.RowHeight, AutoKillKey, "autokill", zb)
 
-    DrawCardToggleRow(leftX, colW, fY + 3 * Config.RowHeight, "Auto Retry",
+    DrawCardToggleRow(leftX, colW, fY + 3 * Config.RowHeight, "Auto Refill",
+        Features.AutoRefill, Colors.HitboxColor, zb, function()
+            Features.AutoRefill = not Features.AutoRefill
+            CreateContent()
+        end)
+
+    DrawCardToggleRow(leftX, colW, fY + 4 * Config.RowHeight, "Auto Retry",
         Features.AutoRetry, Colors.AccentRed, zb, function()
             Features.AutoRetry = not Features.AutoRetry
             CreateContent()
         end)
 
-    DrawCardToggleRow(leftX, colW, fY + 4 * Config.RowHeight, "Auto QTE Escape",
+    DrawCardToggleRow(leftX, colW, fY + 5 * Config.RowHeight, "Auto QTE Escape",
         Features.AutoQTE, Colors.QTEColor, zb, function()
             Features.AutoQTE = not Features.AutoQTE
             CreateContent()
@@ -1392,6 +1509,18 @@ local function PageAutomation(zb, cardX, cardW)
     GUI.HitboxSizeVal = DrawStatRow(rightX, colW, sY + 30,   "Hitbox Size",     HitboxSize, zb)
     GUI.KillsVal      = DrawStatRow(rightX, colW, sY + 60,   "Titans Killed",   Stats.TitansKilled, zb)
     GUI.UptimeVal     = DrawStatRow(rightX, colW, sY + 90,   "Uptime",          "00:00", zb)
+
+    -- RIGHT bottom: Lifetime — persistent across executions, lives in
+    -- AOTR/stats.json. Kept under the session Stats card so users can
+    -- compare current vs. all-time at a glance.
+    local lifeTopY = contentTopY + statsH + 14
+    local lifeH    = 52 + 4 * 30 + 10
+    local lY = DrawCard(rightX, lifeTopY, colW, lifeH, "Lifetime", zb)
+
+    GUI.LifeKillsVal   = DrawStatRow(rightX, colW, lY,        "Titans Killed",  LifetimeStats.titansKilled, zb)
+    GUI.LifeRefillsVal = DrawStatRow(rightX, colW, lY + 30,   "Refills",        LifetimeStats.refills, zb)
+    GUI.LifeRetriesVal = DrawStatRow(rightX, colW, lY + 60,   "Retries",        LifetimeStats.retries, zb)
+    GUI.LifeUptimeVal  = DrawStatRow(rightX, colW, lY + 90,   "Total Uptime",   "00:00", zb)
 end
 
 
@@ -1544,6 +1673,26 @@ local function UpdateStatsLive()
             local txt = FormatUptime(getUptimeSeconds(killUptime))
             GUI.UptimeVal.Text = txt
             GUI.UptimeVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.UptimeVal.Position.Y)
+        end
+        if GUI.LifeKillsVal then
+            local txt = tostring(LifetimeStats.titansKilled)
+            GUI.LifeKillsVal.Text = txt
+            GUI.LifeKillsVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.LifeKillsVal.Position.Y)
+        end
+        if GUI.LifeRefillsVal then
+            local txt = tostring(LifetimeStats.refills)
+            GUI.LifeRefillsVal.Text = txt
+            GUI.LifeRefillsVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.LifeRefillsVal.Position.Y)
+        end
+        if GUI.LifeRetriesVal then
+            local txt = tostring(LifetimeStats.retries)
+            GUI.LifeRetriesVal.Text = txt
+            GUI.LifeRetriesVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.LifeRetriesVal.Position.Y)
+        end
+        if GUI.LifeUptimeVal then
+            local txt = FormatUptime(LifetimeStats.uptime)
+            GUI.LifeUptimeVal.Text = txt
+            GUI.LifeUptimeVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.LifeUptimeVal.Position.Y)
         end
     end)
 end
@@ -1976,6 +2125,8 @@ UnloadScript = function()
     Features.AutoQTE        = false
     Features.AutoRetry      = false
     Features.ErenRaid       = false
+    Features.AutoRefill     = false
+    RefillingNow            = false
     pcall(restoreTitans)
     pcall(restoreAutoKillTitans)
     for _, el in ipairs(GUI.Elements)        do pcall(function() el:Remove() end) end
@@ -1987,6 +2138,7 @@ UnloadScript = function()
     VisualizerLines = {}
     ClearContent()
     clearMiniPanel()
+    pcall(saveLifetimeStats)   -- flush last few seconds of progress
     notify("AOT:R unloaded", "AOT:R", 3)
 end
 
@@ -2038,6 +2190,12 @@ task.spawn(function()
     local lastAttack = 0
     local activeTitan, activeNape = nil, nil
     local cycleCount = 0
+    -- Stuck-target failsafe: blades sometimes get wedged inside the
+    -- nape and stop registering hits. If we've been parked on the
+    -- same target for 20s without it dying, tap R (swap blades) and
+    -- force a re-pick. Reset whenever the target changes.
+    local targetAcquiredAt = 0
+    local STUCK_TIMEOUT    = 20
 
     local function applyHitbox()
         local titansFolder = Workspace:FindFirstChild("Titans")
@@ -2058,9 +2216,16 @@ task.spawn(function()
 
     while GUI.Running do
         if Features.AutoKill or Features.ErenRaid then
-            prevActive = true
+            -- Auto Refill is doing its TP → E → 5s wait. Stand down
+            -- entirely (no TPs, no slashes) but DON'T restore titan
+            -- sizes — we want them still expanded for when we come
+            -- back.
+            if RefillingNow then
+                task.wait(0.1)
+            else
+                prevActive = true
 
-            applyHitbox()
+                applyHitbox()
 
             -- Target picker depends on mode. ErenRaid prioritises
             -- the titan closest to the rock (so they never reach it)
@@ -2074,10 +2239,23 @@ task.spawn(function()
                 if newTitan ~= activeTitan then
                     activeTitan, activeNape = newTitan, newNape
                     cycleCount = 0
+                    targetAcquiredAt = tick()
                 end
             elseif not (activeTitan and findHumanoid(activeTitan)) then
                 activeTitan, activeNape = getNearestLiveTitan()
                 cycleCount = 0
+                targetAcquiredAt = tick()
+            end
+
+            -- Stuck-target failsafe.
+            if activeTitan and (tick() - targetAcquiredAt) > STUCK_TIMEOUT then
+                pcall(keypress,   0x52)   -- R: swap blades
+                task.wait(0.08)
+                pcall(keyrelease, 0x52)
+                -- Drop current target so the next iteration re-picks.
+                activeTitan, activeNape = nil, nil
+                cycleCount = 0
+                targetAcquiredAt = tick()
             end
 
             if activeTitan and activeNape then
@@ -2135,6 +2313,7 @@ task.spawn(function()
             else
                 task.wait(0.3)
             end
+            end   -- close: else of `if RefillingNow` (active, not refilling)
         else
             if prevActive then
                 restoreAutoKillTitans()
@@ -2144,6 +2323,54 @@ task.spawn(function()
             end
             task.wait(0.2)
         end
+    end
+end)
+
+-- Auto Refill — when the blade-set HUD counter hits 0 and a kill
+-- mode is active, TP to the nearest gas-tank Refill part, press R,
+-- wait 5s for the refill animation, then resume. The RefillingNow
+-- flag tells the Auto Kill loop to stand down during this window.
+local VK_REFILL_KEY = 0x52   -- R
+
+task.spawn(function()
+    while GUI.Running do
+        if Features.AutoRefill
+           and (Features.AutoKill or Features.ErenRaid)
+           and not RefillingNow then
+            local sets = getBladeSets()
+            if sets == 0 then
+                local refill = getNearestRefill()
+                if refill then
+                    RefillingNow = true
+
+                    local hrp = getHRP()
+                    local okP, rPos = pcall(function() return refill.Position end)
+                    if hrp and okP and rPos then
+                        -- Settle on top of the refill part. +5 stud
+                        -- offset so we don't clip into geometry.
+                        pcall(function()
+                            hrp.CFrame = CFrame.new(rPos.X, rPos.Y + 5, rPos.Z)
+                        end)
+                        pcall(function() hrp.AssemblyLinearVelocity = Vector3.zero end)
+                        pcall(function() hrp.Velocity = Vector3.zero end)
+
+                        task.wait(5)     -- settle on the tank before pressing R
+
+                        pcall(keypress,   VK_REFILL_KEY)
+                        task.wait(0.1)
+                        pcall(keyrelease, VK_REFILL_KEY)
+
+                        task.wait(5)     -- refill animation window
+
+                        LifetimeStats.refills = LifetimeStats.refills + 1
+                        LifetimeDirty = true
+                    end
+
+                    RefillingNow = false
+                end
+            end
+        end
+        task.wait(0.5)
     end
 end)
 
@@ -2298,9 +2525,31 @@ task.spawn(function()
                 tap(VK_D)
                 task.wait(0.3)
                 tap(VK_ENTER)
+
+                LifetimeStats.retries = LifetimeStats.retries + 1
+                LifetimeDirty = true
             end
         end
         task.wait(0.5)
+    end
+end)
+
+-- Lifetime stats: accumulate uptime in 5s ticks while a kill mode is
+-- active, and flush to disk every 30s (or sooner if a counter event
+-- has marked the stats dirty). Uses a separate cadence from the
+-- counter increments so we batch disk writes.
+task.spawn(function()
+    local lastSaveAt = tick()
+    while GUI.Running do
+        task.wait(5)
+        if Features.AutoKill or Features.ErenRaid then
+            LifetimeStats.uptime = LifetimeStats.uptime + 5
+            LifetimeDirty = true
+        end
+        if LifetimeDirty and tick() - lastSaveAt >= 30 then
+            saveLifetimeStats()
+            lastSaveAt = tick()
+        end
     end
 end)
 
@@ -2320,6 +2569,8 @@ task.spawn(function()
                         local alive = findHumanoid(titan) ~= nil
                         if lastTitanState[addr] == true and not alive then
                             Stats.TitansKilled = Stats.TitansKilled + 1
+                            LifetimeStats.titansKilled = LifetimeStats.titansKilled + 1
+                            LifetimeDirty = true
                         end
                         lastTitanState[addr] = alive
                     end
@@ -2610,6 +2861,7 @@ end
 -- ============================================================
 
 loadConfig()
+loadLifetimeStats()
 Init()
 task.spawn(InputLoop)
 notify("AOT:R loaded — " .. getKeyName(GUI.ToggleKey) .. " Toggle, End Unload",
