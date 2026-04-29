@@ -83,8 +83,8 @@ local READY_DELAY    = 8
 -- grow unboundedly. Auto-engages its own (smaller) hitbox expansion.
 local AutoKillHitboxSize    = 150
 local AutoKillDropHeight    = 90    -- studs above nape we snap to each cycle
-local AutoKillDropDwell     = 0.18  -- max seconds to fall before TP'ing back up
-local AutoKillFloorBuffer   = 50    -- never let player fall below nape.Y + this
+local AutoKillDropDwell     = 0.16  -- max seconds to fall before TP'ing back up
+local AutoKillFloorBuffer   = 60    -- never let player fall below nape.Y + this
 local AutoKillAnchorEvery   = 3     -- cycles between INSTANT velocity resets
                                     -- (lower = peak speed stays manageable;
                                     --  higher = bigger slam but more nape-grab
