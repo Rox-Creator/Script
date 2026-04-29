@@ -60,7 +60,7 @@ local refillCooldownUntil = 0
 -- normal "no live titans for 3s" trigger never sees a transition.
 local lastKillAt = tick()
 
-local HitboxSize    = 500
+local HitboxSize    = 200
 local KillCooldown  = 0.35
 local RefreshRate   = 0.2
 local OriginalSizes = {}
@@ -430,6 +430,36 @@ local function saveConfig()
         },
     }
     task.spawn(function()
+        pcall(function()
+            if type(makefolder) == "function" and type(isfolder) == "function"
+               and not isfolder(CONFIG_DIR) then
+                makefolder(CONFIG_DIR)
+            end
+            writefile(CONFIG_PATH, HttpService:JSONEncode(data))
+        end)
+    end)
+end
+
+-- Auto-save just the AutoKill on/off flag. Reads the existing
+-- config, patches the one field, writes back — so other unsaved
+-- tweaks (slider, binds, other toggles) aren't accidentally
+-- committed when AutoKill flips. Why this exists: the user can't
+-- click "Save Config" while AutoKill is on, because the loop is
+-- pressing the mouse for them.
+local function saveAutoKillState()
+    if type(writefile) ~= "function" then return end
+    task.spawn(function()
+        local data = {}
+        if type(readfile) == "function" and type(isfile) == "function"
+           and isfile(CONFIG_PATH) then
+            local ok, raw = pcall(readfile, CONFIG_PATH)
+            if ok and type(raw) == "string" then
+                local okJ, decoded = pcall(function() return HttpService:JSONDecode(raw) end)
+                if okJ and type(decoded) == "table" then data = decoded end
+            end
+        end
+        data.features = data.features or {}
+        data.features.AutoKill = Features.AutoKill
         pcall(function()
             if type(makefolder) == "function" and type(isfolder) == "function"
                and not isfolder(CONFIG_DIR) then
@@ -2073,6 +2103,7 @@ setAutoKillOn = function(on)
     Features.AutoKill = on
     syncKillUptime()
     if on then lastKillAt = tick() end   -- arm stuck-mission watchdog
+    saveAutoKillState()                  -- persist on/off across reloads
     if GUI.Visible then CreateContent() end
 end
 
