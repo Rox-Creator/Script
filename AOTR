@@ -82,7 +82,7 @@ local READY_DELAY    = 10
 -- nape-grab); an anchor every N cycles zeroes velocity so it doesn't
 -- grow unboundedly. Auto-engages its own (smaller) hitbox expansion.
 local AutoKillHitboxSize    = 150
-local AutoKillDropHeight    = 90    -- studs above nape we snap to each cycle
+local AutoKillDropHeight    = 80    -- studs above nape we snap to each cycle
 local AutoKillDropDwell     = 0.15  -- max seconds to fall before TP'ing back up
 local AutoKillFloorBuffer   = 50    -- never let player fall below nape.Y + this
 local AutoKillAnchorEvery   = 3     -- cycles between INSTANT velocity resets
