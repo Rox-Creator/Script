@@ -1,5 +1,5 @@
 -- Attack on Titan Revolution — Bridger-style menu
--- Hitbox Expander + Visualizer + Auto Kill + Auto QTE
+-- Hitbox Expander + Auto Kill + Auto QTE + Auto Refill + Auto Retry
 --
 -- Controls:
 --   F3 (default) = toggle GUI visibility
@@ -30,7 +30,6 @@ local GUI = {}
 
 local Features = {
     HitboxExpander = false,
-    Visualizer     = false,
     AutoKill       = false,
     AutoQTE        = false,
     AutoRetry      = false,
@@ -38,7 +37,7 @@ local Features = {
                               -- closest to BigRock first so they don't
                               -- damage Eren during Defend Eren.
     AutoRefill     = false,   -- TP to nearest GasTanks.Refill, press
-                              -- E, wait 5s when blade-set count hits 0.
+                              -- R when blade-set count hits 0.
 }
 
 -- Set true while the Auto Refill loop is actively refilling, so the
@@ -64,8 +63,17 @@ local lastKillAt = tick()
 local HitboxSize    = 1000
 local KillCooldown  = 0.35
 local RefreshRate   = 0.2
-local KillKey       = nil
 local OriginalSizes = {}
+
+-- After a sub-place teleport (or first load) the character spawns
+-- in mid-air and isn't controllable for a few seconds. Auto Kill /
+-- Auto Refill stand down for this long after script start so the
+-- player isn't TPed onto a titan / refill before they've finished
+-- loading in. Re-injection via queue_on_teleport runs the script
+-- afresh, so SCRIPT_LOAD_AT resets each time and the delay applies
+-- on every map.
+local SCRIPT_LOAD_AT = tick()
+local READY_DELAY    = 10
 
 -- Auto Kill drop pattern: TPs the player to (nape + DropHeight) every
 -- cycle without zeroing AssemblyLinearVelocity, so downward speed
@@ -77,7 +85,7 @@ local AutoKillHitboxSize    = 150
 local AutoKillDropHeight    = 90    -- studs above nape we snap to each cycle
 local AutoKillDropDwell     = 0.15  -- max seconds to fall before TP'ing back up
 local AutoKillFloorBuffer   = 50    -- never let player fall below nape.Y + this
-local AutoKillAnchorEvery   = 4     -- cycles between INSTANT velocity resets
+local AutoKillAnchorEvery   = 3     -- cycles between INSTANT velocity resets
                                     -- (lower = peak speed stays manageable;
                                     --  higher = bigger slam but more nape-grab
                                     --  / floor-overshoot risk)
@@ -88,21 +96,6 @@ local AutoKillOriginalSizes = {}    -- separate from OriginalSizes so toggling
 local HitboxKey   = 0x70   -- F1 default
 local AutoKillKey = 0x71   -- F2 default
 local ListeningForBind = nil   -- "hitbox" / "autokill" while picking a key
-
--- Visualizer state
-local VisualizerLines = {}
-local VIS_COLOR = Color3.fromRGB(95, 145, 230)
-local CornerSigns = {
-    Vector3.new(-1,-1,-1), Vector3.new( 1,-1,-1),
-    Vector3.new( 1, 1,-1), Vector3.new(-1, 1,-1),
-    Vector3.new(-1,-1, 1), Vector3.new( 1,-1, 1),
-    Vector3.new( 1, 1, 1), Vector3.new(-1, 1, 1),
-}
-local BoxEdges = {
-    {1,2},{2,3},{3,4},{4,1},
-    {5,6},{6,7},{7,8},{8,5},
-    {1,5},{2,6},{3,7},{4,8},
-}
 
 -- Stats
 -- TitansKilled = total this script execution (resets on script unload).
@@ -152,8 +145,6 @@ end
 -- Raid tab placeholder feature flags. Stub toggles for future raid
 -- automation features — wire them up to actual logic when added.
 local RaidFlags = {
-    Slot1 = false,
-    Slot2 = false,
     Slot3 = false,
     Slot4 = false,
 }
@@ -428,7 +419,7 @@ end
 
 -- saveConfig is only called from the explicit Save button on the
 -- Settings page. Toggles and sliders DO NOT auto-save anymore — that
--- was causing every flip of Visualizer / AutoKill / etc. to overwrite
+-- was causing every flip of AutoKill / etc. to overwrite
 -- the on-disk file mid-session.
 local function saveConfig()
     if type(writefile) ~= "function" then return end
@@ -443,7 +434,6 @@ local function saveConfig()
         },
         features = {
             HitboxExpander = Features.HitboxExpander,
-            Visualizer     = Features.Visualizer,
             AutoKill       = Features.AutoKill,
             AutoQTE        = Features.AutoQTE,
             AutoRetry      = Features.AutoRetry,
@@ -480,7 +470,6 @@ local function loadConfig()
     end
     if type(data.features) == "table" then
         if type(data.features.HitboxExpander) == "boolean" then Features.HitboxExpander = data.features.HitboxExpander end
-        if type(data.features.Visualizer)     == "boolean" then Features.Visualizer     = data.features.Visualizer     end
         if type(data.features.AutoKill)       == "boolean" then Features.AutoKill       = data.features.AutoKill       end
         if type(data.features.AutoQTE)        == "boolean" then Features.AutoQTE        = data.features.AutoQTE        end
         if type(data.features.AutoRetry)      == "boolean" then Features.AutoRetry      = data.features.AutoRetry      end
@@ -581,42 +570,10 @@ local function getHRP()
     return hrp
 end
 
-local function getNearestNape()
-    local titansFolder = Workspace:FindFirstChild("Titans")
-    if not titansFolder then return nil end
-    local hrp = getHRP()
-    if not hrp then return nil end
-    local okPP, pPos = pcall(function() return hrp.Position end)
-    if not (okPP and pPos) then return nil end
-    local closest, closestD2 = nil, math.huge
-    for _, titan in ipairs(titansFolder:GetChildren()) do
-        if findHumanoid(titan) then
-            local nape = getNape(titan)
-            if nape then
-                local okN, npos = pcall(function() return nape.Position end)
-                if okN and npos then
-                    local dx = pPos.X - npos.X
-                    local dy = pPos.Y - npos.Y
-                    local dz = pPos.Z - npos.Z
-                    local d2 = dx*dx + dy*dy + dz*dz
-                    if d2 < closestD2 then closestD2 = d2; closest = nape end
-                end
-            end
-        end
-    end
-    return closest
-end
-
 local function performAttack()
-    if KillKey then
-        pcall(keypress, KillKey)
-        task.wait(0.05)
-        pcall(keyrelease, KillKey)
-    else
-        pcall(mouse1press)
-        task.wait(0.06)
-        pcall(mouse1release)
-    end
+    pcall(mouse1press)
+    task.wait(0.06)
+    pcall(mouse1release)
 end
 
 -- Returns nearest titan that still has a Humanoid, with both the
@@ -856,84 +813,6 @@ local function getRewardTimeTaken()
     return nil
 end
 
-local function getOrCreateLine(idx)
-    local ln = VisualizerLines[idx]
-    if ln then return ln end
-    ln = Drawing.new("Line")
-    ln.Color = VIS_COLOR
-    ln.Thickness = 1
-    ln.Visible = false
-    ln.ZIndex = 50
-    VisualizerLines[idx] = ln
-    return ln
-end
-
--- Free every Drawing.Line in the pool. Hiding them isn't enough —
--- Matcha caps total Drawing instances and a hidden line still counts
--- against that budget, which is what eventually crashes us if the
--- user toggles the visualizer on/off across a long session.
-local function hideAllVisualizerLines()
-    for _, ln in ipairs(VisualizerLines) do
-        pcall(function() ln:Remove() end)
-    end
-    VisualizerLines = {}
-end
-
-local function updateVisualizer()
-    if not Features.Visualizer then hideAllVisualizerLines() return end
-    local titansFolder = Workspace:FindFirstChild("Titans")
-    if not titansFolder then hideAllVisualizerLines() return end
-    local lineIdx = 0
-    for _, titan in ipairs(titansFolder:GetChildren()) do
-        local nape = findHumanoid(titan) and getNape(titan) or nil
-        if nape then
-            local okSz, sz  = pcall(function() return nape.Size end)
-            local okCF, cf  = pcall(function() return nape.CFrame end)
-            local okPos, ps = pcall(function() return nape.Position end)
-            if okSz and sz and ((okCF and cf) or (okPos and ps)) then
-                local hx, hy, hz = sz.X / 2, sz.Y / 2, sz.Z / 2
-                local screenCorners = {}
-                local anyOnScreen = false
-                for i = 1, 8 do
-                    local s = CornerSigns[i]
-                    local world
-                    if cf then
-                        local okW, w = pcall(function()
-                            return cf * Vector3.new(s.X * hx, s.Y * hy, s.Z * hz)
-                        end)
-                        if okW then world = w end
-                    else
-                        world = ps + Vector3.new(s.X * hx, s.Y * hy, s.Z * hz)
-                    end
-                    if world then
-                        local s2d, onScreen = WorldToScreen(world)
-                        if s2d then
-                            screenCorners[i] = s2d
-                            if onScreen then anyOnScreen = true end
-                        end
-                    end
-                end
-                if anyOnScreen then
-                    for _, e in ipairs(BoxEdges) do
-                        local p1 = screenCorners[e[1]]
-                        local p2 = screenCorners[e[2]]
-                        if p1 and p2 then
-                            lineIdx = lineIdx + 1
-                            local ln = getOrCreateLine(lineIdx)
-                            pcall(function()
-                                ln.From = p1; ln.To = p2; ln.Visible = true
-                            end)
-                        end
-                    end
-                end
-            end
-        end
-    end
-    for i = lineIdx + 1, #VisualizerLines do
-        pcall(function() VisualizerLines[i].Visible = false end)
-    end
-end
-
 -- Forward-decl so toggle handlers can flip features through one path.
 local setHitboxOn, setAutoKillOn, applyMinimizedState
 local CreateContent, ClearContent, UnloadScript
@@ -1015,7 +894,6 @@ local Colors = {
     HitboxColor  = Color3.fromRGB(60, 160, 255),
     KillColor    = Color3.fromRGB(255, 100, 100),
     QTEColor     = Color3.fromRGB(255, 200, 60),
-    DebugColor   = Color3.fromRGB(180, 130, 255),
 }
 
 local Config = {
@@ -1781,8 +1659,8 @@ local function PageAutomation(zb, cardX, cardW)
     local contentTopY = contentTopFor("Main")
     local leftX, rightX, colW = splitCols(cardX, cardW)
 
-    -- LEFT: Features (6 toggles)
-    local featuresH = 52 + 6 * Config.RowHeight + 14
+    -- LEFT: Features (5 toggles)
+    local featuresH = 52 + 5 * Config.RowHeight + 14
     local fY = DrawCard(leftX, contentTopY, colW, featuresH, "Features", zb)
 
     DrawCardToggleRow(leftX, colW, fY, "Hitbox Expander",
@@ -1791,32 +1669,25 @@ local function PageAutomation(zb, cardX, cardW)
         end)
     drawHotkeyPill(leftX, colW, fY, HitboxKey, "hitbox", zb)
 
-    DrawCardToggleRow(leftX, colW, fY + Config.RowHeight, "Visualizer",
-        Features.Visualizer, Colors.QTEColor, zb, function()
-            Features.Visualizer = not Features.Visualizer
-            if not Features.Visualizer then hideAllVisualizerLines() end
-            CreateContent()
-        end)
-
-    DrawCardToggleRow(leftX, colW, fY + 2 * Config.RowHeight, "Auto Kill",
+    DrawCardToggleRow(leftX, colW, fY + Config.RowHeight, "Auto Kill",
         Features.AutoKill, Colors.KillColor, zb, function()
             setAutoKillOn(not Features.AutoKill)
         end)
-    drawHotkeyPill(leftX, colW, fY + 2 * Config.RowHeight, AutoKillKey, "autokill", zb)
+    drawHotkeyPill(leftX, colW, fY + Config.RowHeight, AutoKillKey, "autokill", zb)
 
-    DrawCardToggleRow(leftX, colW, fY + 3 * Config.RowHeight, "Auto Refill",
+    DrawCardToggleRow(leftX, colW, fY + 2 * Config.RowHeight, "Auto Refill",
         Features.AutoRefill, Colors.HitboxColor, zb, function()
             Features.AutoRefill = not Features.AutoRefill
             CreateContent()
         end)
 
-    DrawCardToggleRow(leftX, colW, fY + 4 * Config.RowHeight, "Auto Retry",
+    DrawCardToggleRow(leftX, colW, fY + 3 * Config.RowHeight, "Auto Retry",
         Features.AutoRetry, Colors.AccentRed, zb, function()
             Features.AutoRetry = not Features.AutoRetry
             CreateContent()
         end)
 
-    DrawCardToggleRow(leftX, colW, fY + 5 * Config.RowHeight, "Auto QTE Escape",
+    DrawCardToggleRow(leftX, colW, fY + 4 * Config.RowHeight, "Auto QTE Escape",
         Features.AutoQTE, Colors.QTEColor, zb, function()
             Features.AutoQTE = not Features.AutoQTE
             CreateContent()
@@ -2565,7 +2436,6 @@ end
 UnloadScript = function()
     GUI.Running = false
     Features.HitboxExpander = false
-    Features.Visualizer     = false
     Features.AutoKill       = false
     Features.AutoQTE        = false
     Features.AutoRetry      = false
@@ -2574,13 +2444,11 @@ UnloadScript = function()
     RefillingNow            = false
     pcall(restoreTitans)
     pcall(restoreAutoKillTitans)
-    for _, el in ipairs(GUI.Elements)        do pcall(function() el:Remove() end) end
-    for _, el in ipairs(GUI.NavElements)     do pcall(function() el:Remove() end) end
-    for _, el in ipairs(VisualizerLines)     do pcall(function() el:Remove() end) end
-    GUI.Elements = {}
-    GUI.NavElements = {}
+    for _, el in ipairs(GUI.Elements)    do pcall(function() el:Remove() end) end
+    for _, el in ipairs(GUI.NavElements) do pcall(function() el:Remove() end) end
+    GUI.Elements      = {}
+    GUI.NavElements   = {}
     GUI.NavClickables = {}
-    VisualizerLines = {}
     ClearContent()
     clearMiniPanel()
     pcall(saveLifetimeStats)   -- flush last few seconds of progress
@@ -2597,20 +2465,6 @@ task.spawn(function()
     while GUI.Running do
         if Features.HitboxExpander then pcall(expandTitans) end
         task.wait(RefreshRate)
-    end
-end)
-
--- Visualizer render loop. Idles slowly when the feature is off so we
--- don't burn coroutine time at 33Hz on a no-op every frame. Polls at
--- ~20Hz when on, which is plenty for wireframe smoothness.
-task.spawn(function()
-    while GUI.Running do
-        if Features.Visualizer then
-            pcall(updateVisualizer)
-            task.wait(0.05)
-        else
-            task.wait(0.5)
-        end
     end
 end)
 
@@ -2632,16 +2486,23 @@ end)
 --     set true (Left_nape_grab / Right_air_grab / etc.), the loop
 --     TPs the player up high, zeroes velocity, and freezes for 0.5s.
 task.spawn(function()
+    -- Hold off until the player has had time to load into the map
+    -- (see READY_DELAY at the top of the script).
+    while tick() - SCRIPT_LOAD_AT < READY_DELAY do task.wait(0.5) end
+
     local prevActive = false
     local lastAttack = 0
     local activeTitan, activeNape = nil, nil
     local cycleCount = 0
     -- Stuck-target failsafe: blades sometimes get wedged inside the
     -- nape and stop registering hits. If we've been parked on the
-    -- same target for 20s without it dying, tap R (swap blades) and
-    -- force a re-pick. Reset whenever the target changes.
+    -- same target for 30s without it dying, tap R (swap blades) and
+    -- force a re-pick. Reset whenever the target changes. The timer
+    -- is also paused while Auto Refill owns the player, otherwise
+    -- the long refill animation eats into the budget and we'd press
+    -- R mid-refill.
     local targetAcquiredAt = 0
-    local STUCK_TIMEOUT    = 20
+    local STUCK_TIMEOUT    = 30
 
     local function applyHitbox()
         local titansFolder = Workspace:FindFirstChild("Titans")
@@ -2667,6 +2528,9 @@ task.spawn(function()
             -- sizes — we want them still expanded for when we come
             -- back.
             if RefillingNow then
+                -- Hold the stuck-target clock at "now" so the moment
+                -- refill ends we don't immediately fire R again.
+                targetAcquiredAt = tick()
                 task.wait(0.1)
             else
                 prevActive = true
@@ -2787,6 +2651,9 @@ end)
 local VK_REFILL_KEY = 0x52   -- R
 
 task.spawn(function()
+    -- Same load-in hold-off as AutoKill — refill is just as
+    -- disruptive if it fires before the character is controllable.
+    while tick() - SCRIPT_LOAD_AT < READY_DELAY do task.wait(0.5) end
     while GUI.Running do
         if Features.AutoRefill
            and (Features.AutoKill or Features.ErenRaid)
@@ -2843,6 +2710,16 @@ task.spawn(function()
                     end
 
                     RefillingNow = false
+                    -- Hard cooldown after every refill attempt — the
+                    -- HUD blade-set counter takes a beat to update,
+                    -- and without this the next loop iteration sees
+                    -- a still-zero count and fires another refill
+                    -- (= the "double refill" bug). 8s is enough for
+                    -- AOT:R's UI to catch up on success and short
+                    -- enough that a real soft-fail still retries.
+                    if tick() >= refillCooldownUntil then
+                        refillCooldownUntil = tick() + 8
+                    end
                 end
             end
         end
@@ -3098,8 +2975,8 @@ task.spawn(function()
         task.wait(0.5)
         pcall(function()
             if not GUI.StatusDot or not GUI.StatusText then return end
-            local active = Features.HitboxExpander or Features.Visualizer
-                or Features.AutoKill or Features.AutoQTE or Features.ErenRaid
+            local active = Features.HitboxExpander or Features.AutoKill
+                or Features.AutoQTE or Features.ErenRaid or Features.AutoRefill
             GUI.StatusDot.Color = active and Colors.StatusOn or Colors.StatusOff
             GUI.StatusText.Text = active and "Active" or "Idle"
         end)
