@@ -46,6 +46,21 @@ local Features = {
 -- the player position during the refill animation.
 local RefillingNow = false
 
+-- Refill watchdog. AOT:R's refill prompt sometimes won't accept R
+-- (camera not facing the tank, character clipped, etc.), and the
+-- script can spin forever trying. We detect failure (blades didn't
+-- go up after the cycle) and after 3 strikes we cool down 5 minutes
+-- before trying again.
+local refillFailures      = 0
+local refillCooldownUntil = 0
+
+-- Stuck-mission watchdog. Updated on every titan kill. The Auto
+-- Retry loop force-fires when this stops advancing for too long while
+-- AutoKill is on and titan models still exist in workspace — covers
+-- the "mission ended with titans still alive" edge case where the
+-- normal "no live titans for 3s" trigger never sees a transition.
+local lastKillAt = tick()
+
 local HitboxSize    = 1000
 local KillCooldown  = 0.35
 local RefreshRate   = 0.2
@@ -61,7 +76,7 @@ local OriginalSizes = {}
 local AutoKillHitboxSize    = 150
 local AutoKillDropHeight    = 90    -- studs above nape we snap to each cycle
 local AutoKillDropDwell     = 0.15  -- max seconds to fall before TP'ing back up
-local AutoKillFloorBuffer   = 20    -- never let player fall below nape.Y + this
+local AutoKillFloorBuffer   = 50    -- never let player fall below nape.Y + this
 local AutoKillAnchorEvery   = 4     -- cycles between INSTANT velocity resets
                                     -- (lower = peak speed stays manageable;
                                     --  higher = bigger slam but more nape-grab
@@ -90,7 +105,17 @@ local BoxEdges = {
 }
 
 -- Stats
-local Stats = { TitansKilled = 0 }
+-- TitansKilled = total this script execution (resets on script unload).
+-- RunKills     = total since last Auto Retry — included in the
+--                "Mission Completed" webhook embed and reset to 0
+--                immediately after sending.
+local Stats = { TitansKilled = 0, RunKills = 0 }
+
+-- Discord webhook. Default is hardcoded for quick testing; the
+-- on-disk file at c:\matcha\workspace\AOTR\webhook.txt overrides
+-- it if non-empty. Empty / missing file → keeps the default.
+local WEBHOOK_URL  = "https://discord.com/api/webhooks/1498885994923954227/8g3_F1lwASSc6p0vREh43wiABisuzh8RpNYVK2vBa9PdZnMCGo4kwWWkwgDLHZDgzZD2"
+local WEBHOOK_PATH = "AOTR/webhook.txt"
 
 -- Lifetime / persistent stats. Lives in its own file so it survives
 -- config corruption / format changes. Updated in-memory on each event
@@ -155,6 +180,223 @@ local function getKeyName(vk) return VK_NAMES[vk] or string.format("0x%02X", vk)
 local CONFIG_DIR  = "AOTR"
 local CONFIG_PATH = CONFIG_DIR .. "/RoxAOTR.json"
 local STATS_PATH  = CONFIG_DIR .. "/stats.json"
+
+-- Format integers with comma thousands separators ("1234567" →
+-- "1,234,567"). Declared up here so the webhook senders below can
+-- use it; FormatUptime / the original commaFmt callsite further
+-- down still works with this definition (single source of truth).
+local function commaFmt(n)
+    n = math.floor(tonumber(n) or 0)
+    local s = tostring(n)
+    while true do
+        local replaced
+        s, replaced = s:gsub("^(-?%d+)(%d%d%d)", "%1,%2")
+        if replaced == 0 then break end
+    end
+    return s
+end
+
+-- "01:49" style for the per-mission timer.
+local function fmtMMSS(seconds)
+    seconds = math.floor(tonumber(seconds) or 0)
+    return string.format("%02d:%02d", math.floor(seconds / 60), seconds % 60)
+end
+
+-- "2m 0s" / "1h 23m" style for session uptime.
+local function fmtHumanDuration(seconds)
+    seconds = math.floor(tonumber(seconds) or 0)
+    if seconds < 60 then return seconds .. "s" end
+    local m = math.floor(seconds / 60)
+    local s = seconds % 60
+    if m < 60 then return string.format("%dm %ds", m, s) end
+    local h = math.floor(m / 60)
+    m = m % 60
+    return string.format("%dh %dm", h, m)
+end
+
+-- ----- Discord webhook ---------------------------------------
+
+local function loadWebhookUrl()
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then return end
+    if not isfile(WEBHOOK_PATH) then return end
+    local ok, raw = pcall(readfile, WEBHOOK_PATH)
+    if not (ok and type(raw) == "string") then return end
+    local trimmed = raw:gsub("^[%s]+", ""):gsub("[%s]+$", "")
+    -- Validate it looks like a Discord webhook URL. The typing-in-
+    -- field pattern can capture stray keystrokes (Matcha's
+    -- iskeypressed is global, not window-focused), so we've seen
+    -- garbage end up on disk. Ignore anything that isn't a real URL.
+    if trimmed:match("^https://discord%.com/api/webhooks/") or
+       trimmed:match("^https://discordapp%.com/api/webhooks/") then
+        WEBHOOK_URL = trimmed
+    end
+end
+
+local function saveWebhookUrl()
+    if type(writefile) ~= "function" then return end
+    task.spawn(function()
+        pcall(function()
+            if type(makefolder) == "function" and type(isfolder) == "function"
+               and not isfolder(CONFIG_DIR) then
+                makefolder(CONFIG_DIR)
+            end
+            writefile(WEBHOOK_PATH, WEBHOOK_URL or "")
+        end)
+    end)
+end
+
+-- POSTs a JSON-encoded payload to the webhook. Matcha exposes
+-- `game:HttpPost(url, body, contentType)` (and the lowercase
+-- `httppost` alias). The executor-style `request` / `syn.request` /
+-- `HttpService:PostAsync` calls are NOT available in Matcha — those
+-- silently fail under pcall, which is why earlier versions of this
+-- function appeared to no-op even when WEBHOOK_URL was set.
+local function sendWebhookRaw(payload)
+    if WEBHOOK_URL == "" then return end
+    local body = HttpService:JSONEncode(payload)
+    task.spawn(function()
+        local fired = false
+        local function try(fn)
+            if fired then return end
+            local ok, err = pcall(fn)
+            if ok then fired = true
+            else print("[AOT:R webhook] " .. tostring(err)) end
+        end
+        try(function() return game:HttpPost(WEBHOOK_URL, body, "application/json") end)
+        try(function() return httppost(WEBHOOK_URL, body, "application/json") end)
+    end)
+end
+
+local function getPlayerName()
+    local ok, name = pcall(function() return LocalPlayer.Name end)
+    if ok and type(name) == "string" and name ~= "" then return name end
+    return "Unknown"
+end
+
+-- AOT:R stores per-player stats (Streak, Level, etc.) as attributes
+-- on the Player instance — i.e. game.Players.zWaleed = LocalPlayer.
+-- The singular GetAttribute(name) call works on Player objects
+-- (unlike on workspace Models, where Matcha's GetAttributes returns
+-- only an array of names and GetAttribute returns nil).
+local function getPlayerAttr(name)
+    local ok, v = pcall(function() return LocalPlayer:GetAttribute(name) end)
+    if ok then
+        local n = tonumber(v)
+        if n then return n end
+    end
+    return 0
+end
+
+local function getKillstreak() return getPlayerAttr("Streak") end
+local function getLevel()      return getPlayerAttr("Level")  end
+
+
+-- Build a Discord embed with the script's blue accent. `fields` is
+-- a list of {name, value, inline=true} tuples. inline defaults to
+-- true unless explicitly set to false.
+local function buildEmbed(title, color, fields)
+    local f = {}
+    for _, fld in ipairs(fields or {}) do
+        table.insert(f, {
+            name   = tostring(fld[1]),
+            value  = tostring(fld[2]),
+            inline = fld[3] ~= false,
+        })
+    end
+    return {
+        embeds = {{
+            title  = title,
+            color  = color,
+            fields = f,
+            footer = { text = "Rox's Menu | AOT:R" },
+        }},
+    }
+end
+
+-- Zero-width space (U+200B). Used as the name/value of an inline
+-- "spacer" field — drops into the current row as a blank 3rd column
+-- to force the next inline field onto a fresh row. Inline (not
+-- non-inline) because a non-inline ZWSP field renders as TWO blank
+-- lines (name + value), giving an awkward double gap; inline lets
+-- it ride along the current row and the gap to the next row stays
+-- at Discord's natural single-row spacing.
+local ZWSP = "\226\128\139"
+local SPACER = { ZWSP, ZWSP, true }
+
+-- Appended to inline-field values to add one line of vertical
+-- padding below them. Discord aligns inline fields by their top
+-- edge and the row's bottom is at the tallest field's bottom — so
+-- if every inline value ends with a newline + ZWSP, every row is
+-- 2 value-lines tall and the next row starts a clean line below.
+-- Cleanest way to get a consistent 1-line gap between every row
+-- without inserting extra full-width spacer fields.
+local PAD = "\n" .. ZWSP
+
+-- Convenience colors (matches the script's own palette).
+local EMBED_OK     = 0x5F91E6   -- accent blue (default mission completed)
+local EMBED_WARN   = 0xFFC83C   -- amber (stuck mission)
+local EMBED_BAD    = 0xFF6464   -- red (refill failed / unloaded)
+local EMBED_GOOD   = 0x50DC8C   -- green (script loaded)
+
+local function sendMissionCompleted(runKills, expGain, goldGain, timeTaken)
+    sendWebhookRaw(buildEmbed("🎯 Mission Completed!", EMBED_OK, {
+        -- PAD lives ONLY on the last cell of each row (Level, Time
+        -- Taken, EXP Gained). That single trailing newline pushes
+        -- the row's height up by one line so the next row starts
+        -- with a clean visible gap. Same number of cells per row,
+        -- but only one of them carries the padding — keeps the
+        -- left-side cells visually clean.
+        -- Row 1: identity / progression
+        { "Player",        getPlayerName(),                          true },
+        { "Killstreak",    tostring(getKillstreak()),                true },
+        { "Level",         tostring(getLevel())             .. PAD,  true },
+        -- Row 2: this mission's outcome
+        { "Titans Killed", tostring(runKills or 0),                  true },
+        { "Time Taken",    fmtMMSS(timeTaken or 0)          .. PAD,  true },
+        -- Forced row break — without this, Discord packs Gold
+        -- Gained onto row 2 (3 inline max per row) and EXP Gained
+        -- ends up alone on row 3.
+        SPACER,
+        -- Row 3: this mission's gains
+        { "Gold Gained",   "+" .. commaFmt(goldGain or 0),           true },
+        { "EXP Gained",    ("+" .. commaFmt(expGain  or 0)) .. PAD,  true },
+        -- Row 4: session-wide totals (full-width)
+        { "Session Overall",
+          string.format("EXP: %s  •  Gold: %s  •  Kills: %s\nRetries: %s  •  Uptime: %s",
+              commaFmt(LifetimeStats.exp),
+              commaFmt(LifetimeStats.gold),
+              commaFmt(LifetimeStats.titansKilled),
+              commaFmt(LifetimeStats.retries),
+              fmtHumanDuration(LifetimeStats.uptime)),
+          false },
+    }))
+end
+
+local function sendStuckMission()
+    sendWebhookRaw(buildEmbed("⚠️ Stuck Mission — Forcing Retry", EMBED_WARN, {
+        { "Player",      getPlayerName(),                          true },
+        { "Killstreak",  tostring(getKillstreak()),                true },
+        { "No Kill For", string.format("%.0fs", tick() - lastKillAt), true },
+    }))
+end
+
+local function sendRefillFailed()
+    sendWebhookRaw(buildEmbed("⛽ Auto Refill Failed (5min cooldown)", EMBED_BAD, {
+        { "Player", getPlayerName(), true },
+    }))
+end
+
+local function sendScriptUnloaded()
+    sendWebhookRaw(buildEmbed("⚫ Script Unloaded", EMBED_BAD, {
+        { "Player", getPlayerName(), true },
+        SPACER,
+        { "Session",
+          string.format("%s kills • %s gold",
+              commaFmt(LifetimeStats.titansKilled),
+              commaFmt(LifetimeStats.gold)),
+          false },
+    }))
+end
 
 local function loadLifetimeStats()
     if type(readfile) ~= "function" or type(isfile) ~= "function" then return end
@@ -407,6 +649,46 @@ local function getNearestLiveTitan()
     return bestTitan, bestNape
 end
 
+-- Best per-titan height signal we have without instance attributes
+-- (Matcha's GetAttribute is unreliable on Model). The HRP scales
+-- with titan tier (3m / 7m / 10m / 15m), so its Size.Y is a clean
+-- proxy. Falls back to nape Y position if HRP isn't available.
+local function getTitanHeight(titan)
+    local hrp
+    pcall(function() hrp = titan:FindFirstChild("HumanoidRootPart") end)
+    if hrp then
+        local okSz, sz = pcall(function() return hrp.Size end)
+        if okSz and sz and sz.Y then return sz.Y end
+    end
+    local nape = getNape(titan)
+    if nape then
+        local okP, p = pcall(function() return nape.Position end)
+        if okP and p and p.Y then return p.Y end
+    end
+    return 0
+end
+
+-- Returns the live titan with the largest HRP (= tallest tier).
+-- Used by AutoKill so the player chops down 15m+ titans before
+-- smaller ones — they hit harder and matter more.
+local function getTallestLiveTitan()
+    local titansFolder = Workspace:FindFirstChild("Titans")
+    if not titansFolder then return nil, nil end
+    local bestTitan, bestNape, bestH = nil, nil, -math.huge
+    for _, titan in ipairs(titansFolder:GetChildren()) do
+        if findHumanoid(titan) then
+            local nape = getNape(titan)
+            if nape then
+                local h = getTitanHeight(titan)
+                if h > bestH then
+                    bestH = h; bestTitan = titan; bestNape = nape
+                end
+            end
+        end
+    end
+    return bestTitan, bestNape
+end
+
 -- Eren Raid: returns the live titan whose nape is closest to the
 -- BigRock (not the player). Falls back to nearest-to-player if the
 -- rock isn't reachable. Sorting only by distance to rock means the
@@ -543,6 +825,37 @@ local function getRewardItemQuantity(slotName)
     return nil
 end
 
+-- Reads "TIME TAKEN" off the Mission Completed rewards screen and
+-- returns it as seconds. The exact UI path varies, so we walk the
+-- Rewards subtree and look for any TextLabel whose text matches
+-- the MM:SS pattern (the only stat in that screen formatted that
+-- way). Returns nil if the rewards screen isn't up or no match
+-- is found.
+local function getRewardTimeTaken()
+    local pg    = LocalPlayer:FindFirstChild("PlayerGui")
+    local iface = pg    and pg:FindFirstChild("Interface")
+    local rew   = iface and iface:FindFirstChild("Rewards")
+    if not rew then return nil end
+
+    local descs
+    pcall(function() descs = rew:GetDescendants() end)
+    if not descs then return nil end
+
+    for _, d in ipairs(descs) do
+        local okC, cn = pcall(function() return d.ClassName end)
+        if okC and (cn == "TextLabel" or cn == "TextButton") then
+            local okT, txt = pcall(function() return d.Text end)
+            if okT and type(txt) == "string" then
+                local mm, ss = txt:match("^%s*(%d+):(%d%d)%s*$")
+                if mm and ss then
+                    return tonumber(mm) * 60 + tonumber(ss)
+                end
+            end
+        end
+    end
+    return nil
+end
+
 local function getOrCreateLine(idx)
     local ln = VisualizerLines[idx]
     if ln then return ln end
@@ -665,13 +978,13 @@ GUI.ActiveSlider     = nil
 GUI.EditingSlider    = nil
 GUI.SliderBuffer     = ""
 GUI.SliderKeyState   = {}
+GUI.EditingWebhook   = false
+GUI.WebhookBuffer    = ""
+GUI.WebhookKeyState  = {}
+GUI.WebhookLabelRef  = nil
 GUI.ContentGen       = 0
 GUI.AnimToken        = 0
 -- Live-stat element refs (populated per-page)
-GUI.TitansVal        = nil
-GUI.HitboxSizeVal    = nil
-GUI.KillsVal         = nil
-GUI.UptimeVal        = nil
 GUI.LifeKillsVal     = nil
 GUI.LifeExpVal       = nil
 GUI.LifeGoldVal      = nil
@@ -893,15 +1206,12 @@ ClearContent = function()
     GUI.ContentElements = {}
     GUI.LiveElements    = {}
     GUI.Clickables      = {}
-    GUI.TitansVal       = nil
-    GUI.HitboxSizeVal   = nil
-    GUI.KillsVal        = nil
-    GUI.UptimeVal       = nil
     GUI.LifeKillsVal    = nil
     GUI.LifeExpVal      = nil
     GUI.LifeGoldVal     = nil
     GUI.LifeRetriesVal  = nil
     GUI.LifeUptimeVal   = nil
+    GUI.WebhookLabelRef = nil
 end
 
 local function DrawCard(x, y, w, h, title, zbase)
@@ -1536,27 +1846,36 @@ local function PageAutomation(zb, cardX, cardW)
     sizeNote.Visible = true; sizeNote.ZIndex = zb + 5
     table.insert(GUI.ContentElements, sizeNote)
 
-    -- RIGHT: Stats (Titans Detected, Hitbox Size, Killed, Uptime)
-    local statsH = 52 + 4 * 30 + 10
-    local sY = DrawCard(rightX, contentTopY, colW, statsH, "Stats", zb)
-
-    GUI.TitansVal     = DrawStatRow(rightX, colW, sY,        "Titans Detected", 0, zb)
-    GUI.HitboxSizeVal = DrawStatRow(rightX, colW, sY + 30,   "Hitbox Size",     HitboxSize, zb)
-    GUI.KillsVal      = DrawStatRow(rightX, colW, sY + 60,   "Titans Killed",   Stats.TitansKilled, zb)
-    GUI.UptimeVal     = DrawStatRow(rightX, colW, sY + 90,   "Uptime",          "00:00", zb)
-
-    -- RIGHT bottom: Lifetime — persistent across executions, lives in
-    -- AOTR/stats.json. Kept under the session Stats card so users can
-    -- compare current vs. all-time at a glance.
-    local lifeTopY = contentTopY + statsH + 14
-    local lifeH    = 52 + 5 * 30 + 10
-    local lY = DrawCard(rightX, lifeTopY, colW, lifeH, "Lifetime", zb)
+    -- RIGHT: Session — persistent across executions but wipeable on
+    -- demand. The "Wipe Session" button at the bottom zeroes
+    -- everything in LifetimeStats and saves immediately, so you can
+    -- press it to start a fresh tally whenever.
+    local sessRowsH = 5 * 30
+    local sessBtnH  = 22
+    local sessH     = 52 + sessRowsH + 10 + sessBtnH + 14
+    local lY = DrawCard(rightX, contentTopY, colW, sessH, "Session", zb)
 
     GUI.LifeKillsVal   = DrawStatRow(rightX, colW, lY,        "Titans Killed", LifetimeStats.titansKilled, zb)
     GUI.LifeExpVal     = DrawStatRow(rightX, colW, lY + 30,   "EXP Gained",    LifetimeStats.exp, zb)
     GUI.LifeGoldVal    = DrawStatRow(rightX, colW, lY + 60,   "Gold Gained",   LifetimeStats.gold, zb)
     GUI.LifeRetriesVal = DrawStatRow(rightX, colW, lY + 90,   "Retries",       LifetimeStats.retries, zb)
-    GUI.LifeUptimeVal  = DrawStatRow(rightX, colW, lY + 120,  "Total Uptime",  "00:00", zb)
+    GUI.LifeUptimeVal  = DrawStatRow(rightX, colW, lY + 120,  "Uptime",        "00:00", zb)
+
+    local btnX = rightX + Config.CardPad
+    local btnY = lY + sessRowsH + 8
+    local btnW = colW - 2 * Config.CardPad
+    DrawSmallButton(btnX, btnY, btnW, sessBtnH, "Wipe Session",
+        Colors.StatusOff, zb, function()
+            LifetimeStats.titansKilled = 0
+            LifetimeStats.exp          = 0
+            LifetimeStats.gold         = 0
+            LifetimeStats.retries      = 0
+            LifetimeStats.uptime       = 0
+            LifetimeDirty = true
+            saveLifetimeStats()   -- flush immediately
+            CreateContent()
+            notify("Session stats wiped", "AOT:R", 2)
+        end, 5)
 end
 
 
@@ -1649,6 +1968,110 @@ local function PageSettings(zb, cardX, cardW)
                 end)
             end
         end, 6)
+
+    -- Webhook card.
+    --   URL field : click to enter text-input mode. Type or Ctrl+V
+    --               paste the URL via OS keystrokes (Matcha can't
+    --               read the clipboard directly). Enter saves to
+    --               disk; Esc cancels.
+    --   Test      : fires a small embed at the current URL.
+    --   Clear     : empties the URL state and the on-disk file.
+    local whTopY = configTopY + configH + 14
+    local whH    = 52 + 28 + 32 + 14
+    local whY    = DrawCard(cardX2, whTopY, cardW2, whH, "Webhook", zb)
+
+    -- Clickable URL field. Truncates from the left when not editing
+    -- so the visually-meaningful tail (the token / channel id) stays
+    -- on screen instead of "https://discord..." filling the box.
+    local fieldX = lx
+    local fieldW = cardW2 - 2 * Config.CardPad
+    local fieldH = 24
+    local fieldY = whY + 4
+
+    local fieldBg = Drawing.new("Square")
+    fieldBg.Position = Vector2.new(fieldX, fieldY)
+    fieldBg.Size = Vector2.new(fieldW, fieldH)
+    fieldBg.Color = Colors.ToggleOff; fieldBg.Filled = true; fieldBg.Corner = 4
+    fieldBg.Visible = true; fieldBg.ZIndex = zb + 4
+    table.insert(GUI.ContentElements, fieldBg)
+
+    local fieldBorder = Drawing.new("Square")
+    fieldBorder.Position = Vector2.new(fieldX, fieldY)
+    fieldBorder.Size = Vector2.new(fieldW, fieldH)
+    fieldBorder.Color = GUI.EditingWebhook and Colors.AccentRed or Colors.CardBorder
+    fieldBorder.Filled = false; fieldBorder.Corner = 4; fieldBorder.Thickness = 1
+    fieldBorder.Visible = true; fieldBorder.ZIndex = zb + 5
+    table.insert(GUI.ContentElements, fieldBorder)
+
+    local maxChars = math.floor((fieldW - 12) / 7)  -- ~7px per char at size 13
+    local rawText, txtCol
+    if GUI.EditingWebhook then
+        rawText = GUI.WebhookBuffer .. "_"
+        txtCol  = Colors.AccentRed
+    elseif WEBHOOK_URL ~= "" then
+        rawText = WEBHOOK_URL
+        txtCol  = Colors.TextPrimary
+    else
+        rawText = "Click to enter URL"
+        txtCol  = Colors.TextMuted
+    end
+    local shown = rawText
+    if #shown > maxChars then
+        shown = "…" .. string.sub(shown, #shown - maxChars + 2)
+    end
+
+    local urlLbl = Drawing.new("Text")
+    urlLbl.Position = Vector2.new(fieldX + 6, fieldY + 5)
+    urlLbl.Text = shown
+    urlLbl.Color = txtCol
+    urlLbl.Size = 13; urlLbl.Font = Drawing.Fonts.System
+    urlLbl.Center = false; urlLbl.Outline = false
+    urlLbl.Visible = true; urlLbl.ZIndex = zb + 6
+    table.insert(GUI.ContentElements, urlLbl)
+    GUI.WebhookLabelRef = urlLbl
+
+    table.insert(GUI.Clickables, {
+        x = fieldX, y = fieldY, w = fieldW, h = fieldH,
+        hover = { el = fieldBorder, base = fieldBorder.Color },
+        onClick = function()
+            if GUI.EditingWebhook then return end
+            GUI.EditingWebhook  = true
+            GUI.WebhookBuffer   = WEBHOOK_URL or ""
+            GUI.WebhookKeyState = {}
+            notify("Type/paste URL. Enter to save, Esc to cancel.", "AOT:R", 4)
+            CreateContent()
+        end,
+    })
+
+    local wBtnGap = 8
+    local wBtnH   = 26
+    local wInner  = cardW2 - 2 * Config.CardPad
+    local wBtnW   = (wInner - wBtnGap) / 2
+    local wBtnY   = fieldY + fieldH + 8
+
+    DrawSmallButton(lx, wBtnY, wBtnW, wBtnH, "Test",
+        Colors.AccentRed, zb, function()
+            if WEBHOOK_URL == "" then
+                notify("No webhook URL set", "AOT:R", 2)
+                return
+            end
+            sendWebhookRaw(buildEmbed("🧪 Webhook Test", EMBED_GOOD, {
+                { "Player",  getPlayerName(),                  true },
+                { "Message", "If you see this, it's working.", false },
+            }))
+            notify("Test embed sent", "AOT:R", 2)
+        end, 6)
+
+    DrawSmallButton(lx + wBtnW + wBtnGap, wBtnY, wBtnW, wBtnH, "Clear",
+        Colors.StatusOff, zb, function()
+            WEBHOOK_URL = ""
+            saveWebhookUrl()
+            GUI.EditingWebhook  = false
+            GUI.WebhookBuffer   = ""
+            GUI.WebhookKeyState = {}
+            notify("Webhook cleared", "AOT:R", 2)
+            CreateContent()
+        end, 6)
 end
 
 CreateContent = function()
@@ -1678,18 +2101,6 @@ local function FormatUptime(seconds)
     return string.format("%02d:%02d", m, s)
 end
 
--- Format integers with comma thousands separators ("1234567" → "1,234,567").
-local function commaFmt(n)
-    n = math.floor(n)
-    local s = tostring(n)
-    while true do
-        local replaced
-        s, replaced = s:gsub("^(-?%d+)(%d%d%d)", "%1,%2")
-        if replaced == 0 then break end
-    end
-    return s
-end
-
 local function getTitanCount()
     local count = 0
     local titansFolder = Workspace:FindFirstChild("Titans")
@@ -1702,26 +2113,6 @@ end
 local function UpdateStatsLive()
     pcall(function()
         local rightEdge = Config.WinX + Config.WinW - Config.ContentPad - Config.CardPad
-        if GUI.TitansVal then
-            local txt = tostring(getTitanCount())
-            GUI.TitansVal.Text = txt
-            GUI.TitansVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.TitansVal.Position.Y)
-        end
-        if GUI.HitboxSizeVal then
-            local txt = tostring(HitboxSize)
-            GUI.HitboxSizeVal.Text = txt
-            GUI.HitboxSizeVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.HitboxSizeVal.Position.Y)
-        end
-        if GUI.KillsVal then
-            local txt = tostring(Stats.TitansKilled)
-            GUI.KillsVal.Text = txt
-            GUI.KillsVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.KillsVal.Position.Y)
-        end
-        if GUI.UptimeVal then
-            local txt = FormatUptime(getUptimeSeconds(killUptime))
-            GUI.UptimeVal.Text = txt
-            GUI.UptimeVal.Position = Vector2.new(rightEdge - #txt * 8, GUI.UptimeVal.Position.Y)
-        end
         if GUI.LifeKillsVal then
             local txt = commaFmt(LifetimeStats.titansKilled)
             GUI.LifeKillsVal.Text = txt
@@ -1930,6 +2321,7 @@ setAutoKillOn = function(on)
     if Features.AutoKill == on then return end
     Features.AutoKill = on
     syncKillUptime()
+    if on then lastKillAt = tick() end   -- arm stuck-mission watchdog
     if GUI.Visible then CreateContent() end
 end
 
@@ -2192,6 +2584,7 @@ UnloadScript = function()
     ClearContent()
     clearMiniPanel()
     pcall(saveLifetimeStats)   -- flush last few seconds of progress
+    sendScriptUnloaded()
     notify("AOT:R unloaded", "AOT:R", 3)
 end
 
@@ -2295,7 +2688,11 @@ task.spawn(function()
                     targetAcquiredAt = tick()
                 end
             elseif not (activeTitan and findHumanoid(activeTitan)) then
-                activeTitan, activeNape = getNearestLiveTitan()
+                -- Tallest-first targeting: lock onto the biggest live
+                -- titan and stay until it dies, then re-pick the next
+                -- tallest. (Switching every cycle would thrash when
+                -- two titans are equally tall.)
+                activeTitan, activeNape = getTallestLiveTitan()
                 cycleCount = 0
                 targetAcquiredAt = tick()
             end
@@ -2380,21 +2777,27 @@ task.spawn(function()
 end)
 
 -- Auto Refill — when the blade-set HUD counter hits 0 and a kill
--- mode is active, TP to the nearest gas-tank Refill part, press R,
--- wait 5s for the refill animation, then resume. The RefillingNow
--- flag tells the Auto Kill loop to stand down during this window.
+-- mode is active, TP to the nearest gas-tank Refill part, press R
+-- (multiple times to cover camera-not-facing-tank failure modes),
+-- then wait for the refill animation. We compare blades-before vs
+-- blades-after; if it didn't go up that's a failed refill, and 3
+-- consecutive failures triggers a 5-minute cooldown so the script
+-- doesn't spin forever in a stuck state (camera angle, character
+-- clipped through tank, etc).
 local VK_REFILL_KEY = 0x52   -- R
 
 task.spawn(function()
     while GUI.Running do
         if Features.AutoRefill
            and (Features.AutoKill or Features.ErenRaid)
-           and not RefillingNow then
+           and not RefillingNow
+           and tick() >= refillCooldownUntil then
             local sets = getBladeSets()
             if sets == 0 then
                 local refill = getNearestRefill()
                 if refill then
                     RefillingNow = true
+                    local bladesBefore = sets
 
                     local hrp = getHRP()
                     local okP, rPos = pcall(function() return refill.Position end)
@@ -2409,11 +2812,34 @@ task.spawn(function()
 
                         task.wait(5)     -- settle on the tank before pressing R
 
-                        pcall(keypress,   VK_REFILL_KEY)
-                        task.wait(0.1)
-                        pcall(keyrelease, VK_REFILL_KEY)
+                        -- Spam R three times across the window. The
+                        -- prompt sometimes drops the first press if
+                        -- the character is still micro-jittering, or
+                        -- if the camera hasn't auto-rotated to face
+                        -- the tank yet. Multiple presses make at
+                        -- least one of them register reliably.
+                        for i = 1, 3 do
+                            pcall(keypress,   VK_REFILL_KEY)
+                            task.wait(0.1)
+                            pcall(keyrelease, VK_REFILL_KEY)
+                            task.wait(1.5)
+                        end
+                        task.wait(2)     -- final settle for animation
 
-                        task.wait(5)     -- refill animation window
+                        local bladesAfter = getBladeSets() or 0
+                        if bladesAfter > bladesBefore then
+                            refillFailures = 0    -- success
+                        else
+                            refillFailures = refillFailures + 1
+                            if refillFailures >= 3 then
+                                refillCooldownUntil = tick() + 300   -- 5 min
+                                refillFailures = 0
+                                pcall(notify,
+                                    "Auto Refill failed 3 times — pausing 5 minutes",
+                                    "AOT:R", 4)
+                                sendRefillFailed()
+                            end
+                        end
                     end
 
                     RefillingNow = false
@@ -2517,24 +2943,36 @@ task.spawn(function()
                 firedThisSession = false   -- new mission active, arm us again
             end
 
-            -- Fire only when:
-            --   - it's been at least 3s since the last live titan was seen
-            --     (gives the rewards screen time to fully animate in and
-            --      the GUI nav system time to focus the default button)
-            --   - it's been at most 30s (sanity bound — long idle in the
-            --     rewards screen shouldn't keep retrying forever)
-            --   - the Retry path is present (rewards UI exists)
-            --   - we haven't already fired this session
-            --   - cooldown elapsed
+            -- Two firing paths, OR'd together. The retry button must
+            -- always exist + cooldown must be met + we haven't fired
+            -- this session. Beyond that:
+            --
+            --   A. NORMAL: had live titans within the last 3-30s and
+            --      now there are none → mission ended cleanly.
+            --   B. STUCK MISSION: AutoKill is on, titan models still
+            --      exist in workspace (so it's not a between-rounds
+            --      idle), but no kill has happened in 3+ minutes —
+            --      mission probably ended weirdly with titans still
+            --      alive and we're frozen out. Force a retry.
             local sinceTitan = tick() - lastSawLiveTitan
-            if (not hasTitan)
-               and sinceTitan >= 3.0
-               and sinceTitan < 30
+            local cleanEnd = (not hasTitan)
+                         and sinceTitan >= 3.0
+                         and sinceTitan < 30
+            local stuckMission = Features.AutoKill
+                              and (tick() - lastKillAt) > 180
+                              and getTitanCount() > 0
+            if (cleanEnd or stuckMission)
                and (not firedThisSession)
                and (tick() - lastFire > 4.0)
                and retryButtonExists() then
                 firedThisSession = true
                 lastFire = tick()
+                if stuckMission and not cleanEnd then
+                    pcall(notify,
+                        "Stuck mission detected — forcing retry",
+                        "AOT:R", 3)
+                    sendStuckMission()
+                end
 
                 -- Re-inject after the sub-place transition. AOT:R's
                 -- retry teleports to a new sub-place, which spawns a
@@ -2573,6 +3011,18 @@ task.spawn(function()
                 LifetimeStats.gold    = LifetimeStats.gold    + goldGain
                 LifetimeStats.retries = LifetimeStats.retries + 1
                 LifetimeDirty = true
+
+                -- Send the mission-completed embed only on the clean
+                -- end path (cleanEnd). The stuck-mission embed has
+                -- already been sent above and these run-stats won't
+                -- be meaningful in that case. Read Time Taken from
+                -- the rewards UI itself — the in-game timer is the
+                -- truth, not anything we'd compute here.
+                local timeTaken = getRewardTimeTaken() or 0
+                if cleanEnd then
+                    sendMissionCompleted(Stats.RunKills, expGain, goldGain, timeTaken)
+                end
+                Stats.RunKills = 0      -- arm for next mission either way
 
                 -- Sequence: \ engages GUI nav (focus lands on Leave),
                 -- two D presses step Leave → Modify → Retry, then
@@ -2626,8 +3076,10 @@ task.spawn(function()
                         local alive = findHumanoid(titan) ~= nil
                         if lastTitanState[addr] == true and not alive then
                             Stats.TitansKilled = Stats.TitansKilled + 1
+                            Stats.RunKills     = Stats.RunKills + 1
                             LifetimeStats.titansKilled = LifetimeStats.titansKilled + 1
                             LifetimeDirty = true
+                            lastKillAt = tick()
                         end
                         lastTitanState[addr] = alive
                     end
@@ -2671,6 +3123,26 @@ local function sliderRising(vk)
     GUI.SliderKeyState[vk] = down
     return down and not was
 end
+
+local function webhookRising(vk)
+    local down = iskeypressed(vk)
+    local was  = GUI.WebhookKeyState[vk]
+    GUI.WebhookKeyState[vk] = down
+    return down and not was
+end
+
+-- VK -> { unshifted_char, shifted_char }. We only handle keys that
+-- can legitimately appear in a Discord webhook URL: letters, digits,
+-- `:`, `/`, `.`, `-`, `_`. Shift state is read live from VK_SHIFT.
+local WebhookKeyMap = {
+    [0xBA] = { ";",  ":" },   -- VK_OEM_1
+    [0xBF] = { "/",  "?" },   -- VK_OEM_2
+    [0xBE] = { ".",  ">" },   -- VK_OEM_PERIOD
+    [0xBD] = { "-",  "_" },   -- VK_OEM_MINUS
+    [0x6E] = { ".",  "."  },  -- numpad decimal
+    [0x6F] = { "/",  "/"  },  -- numpad divide
+    [0x6D] = { "-",  "-"  },  -- numpad subtract
+}
 
 local function InputLoop()
     while GUI.Running do
@@ -2719,6 +3191,124 @@ local function InputLoop()
                     GUI.EditingSlider.valTxt.Text = GUI.SliderBuffer .. "_"
                 end)
             end
+            if GUI.Visible then
+                local mx, my = Mouse.X, Mouse.Y
+                local mouseDown = ismouse1pressed()
+                local justPressed = mouseDown and not GUI.WasMouseDown
+                if justPressed then
+                    for _, c in ipairs(GUI.Clickables) do
+                        if IsInside(mx, my, c.x, c.y, c.w, c.h) then
+                            if c.hover and c.hover.el then pressEffect(c.hover.el) end
+                            c.onClick()
+                            break
+                        end
+                    end
+                end
+                GUI.WasMouseDown = mouseDown
+            else
+                GUI.WasMouseDown = false
+            end
+            break
+        end
+
+        -- Webhook URL text-input mode. Captures direct keystrokes
+        -- only (Matcha exposes no clipboard read, and Ctrl+V paste
+        -- delivers WM_CHAR rather than physical key state — so the
+        -- user types the URL out manually). Gated on isrbxactive()
+        -- so we don't steal keystrokes the user is typing into chat,
+        -- the IDE, etc. — iskeypressed reads global keyboard state.
+        if GUI.EditingWebhook then
+            local rbxFocused = true
+            if type(isrbxactive) == "function" then
+                local ok, v = pcall(isrbxactive)
+                if ok then rbxFocused = v and true or false end
+            end
+            if not rbxFocused then
+                -- Just pump the rising-edge state so we don't burst
+                -- when focus returns. No buffer mutation.
+                for vk in pairs(GUI.WebhookKeyState) do
+                    GUI.WebhookKeyState[vk] = iskeypressed(vk)
+                end
+                break
+            end
+            local bufChanged = false
+            local shift = iskeypressed(0x10) or iskeypressed(0xA0) or iskeypressed(0xA1)
+
+            -- Letters (A..Z) — case follows shift.
+            for vk = 0x41, 0x5A do
+                if webhookRising(vk) then
+                    local ch = string.char(vk)
+                    if not shift then ch = string.lower(ch) end
+                    GUI.WebhookBuffer = GUI.WebhookBuffer .. ch
+                    bufChanged = true
+                end
+            end
+
+            -- Top-row digits (shifted symbols ignored — URLs don't
+            -- need them).
+            for vk = 0x30, 0x39 do
+                if webhookRising(vk) and not shift then
+                    GUI.WebhookBuffer = GUI.WebhookBuffer .. string.char(vk)
+                    bufChanged = true
+                end
+            end
+
+            -- Numpad digits.
+            for vk = 0x60, 0x69 do
+                if webhookRising(vk) then
+                    GUI.WebhookBuffer = GUI.WebhookBuffer .. string.char(vk - 0x60 + 0x30)
+                    bufChanged = true
+                end
+            end
+
+            -- Punctuation that appears in webhook URLs.
+            for vk, pair in pairs(WebhookKeyMap) do
+                if webhookRising(vk) then
+                    GUI.WebhookBuffer = GUI.WebhookBuffer .. (shift and pair[2] or pair[1])
+                    bufChanged = true
+                end
+            end
+
+            if webhookRising(0x08) then  -- Backspace
+                GUI.WebhookBuffer = string.sub(GUI.WebhookBuffer, 1, -2)
+                bufChanged = true
+            end
+
+            if webhookRising(0x0D) then  -- Enter — save
+                local trimmed = GUI.WebhookBuffer
+                    :gsub("^[%s]+", ""):gsub("[%s]+$", "")
+                WEBHOOK_URL = trimmed
+                saveWebhookUrl()
+                GUI.EditingWebhook  = false
+                GUI.WebhookBuffer   = ""
+                GUI.WebhookKeyState = {}
+                if WEBHOOK_URL ~= "" then
+                    notify("Webhook saved", "AOT:R", 2)
+                else
+                    notify("Webhook cleared", "AOT:R", 2)
+                end
+                if GUI.Visible and not GUI.Minimized then CreateContent() end
+            end
+
+            if GUI.EditingWebhook and webhookRising(0x1B) then  -- Esc — cancel
+                GUI.EditingWebhook  = false
+                GUI.WebhookBuffer   = ""
+                GUI.WebhookKeyState = {}
+                if GUI.Visible and not GUI.Minimized then CreateContent() end
+            end
+
+            if bufChanged and GUI.WebhookLabelRef then
+                pcall(function()
+                    local raw = GUI.WebhookBuffer .. "_"
+                    local maxChars = 48
+                    local shown = raw
+                    if #shown > maxChars then
+                        shown = "…" .. string.sub(shown, #shown - maxChars + 2)
+                    end
+                    GUI.WebhookLabelRef.Text = shown
+                end)
+            end
+
             if GUI.Visible then
                 local mx, my = Mouse.X, Mouse.Y
                 local mouseDown = ismouse1pressed()
@@ -2919,6 +3509,7 @@ end
 
 loadConfig()
 loadLifetimeStats()
+loadWebhookUrl()
 Init()
 task.spawn(InputLoop)
 notify("AOT:R loaded — " .. getKeyName(GUI.ToggleKey) .. " Toggle, End Unload",
