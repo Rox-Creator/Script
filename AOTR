@@ -60,7 +60,7 @@ local refillCooldownUntil = 0
 -- normal "no live titans for 3s" trigger never sees a transition.
 local lastKillAt = tick()
 
-local HitboxSize    = 1000
+local HitboxSize    = 500
 local KillCooldown  = 0.35
 local RefreshRate   = 0.2
 local OriginalSizes = {}
@@ -73,7 +73,7 @@ local OriginalSizes = {}
 -- afresh, so SCRIPT_LOAD_AT resets each time and the delay applies
 -- on every map.
 local SCRIPT_LOAD_AT = tick()
-local READY_DELAY    = 10
+local READY_DELAY    = 8
 
 -- Auto Kill drop pattern: TPs the player to (nape + DropHeight) every
 -- cycle without zeroing AssemblyLinearVelocity, so downward speed
@@ -82,8 +82,8 @@ local READY_DELAY    = 10
 -- nape-grab); an anchor every N cycles zeroes velocity so it doesn't
 -- grow unboundedly. Auto-engages its own (smaller) hitbox expansion.
 local AutoKillHitboxSize    = 150
-local AutoKillDropHeight    = 80    -- studs above nape we snap to each cycle
-local AutoKillDropDwell     = 0.15  -- max seconds to fall before TP'ing back up
+local AutoKillDropHeight    = 90    -- studs above nape we snap to each cycle
+local AutoKillDropDwell     = 0.18  -- max seconds to fall before TP'ing back up
 local AutoKillFloorBuffer   = 50    -- never let player fall below nape.Y + this
 local AutoKillAnchorEvery   = 3     -- cycles between INSTANT velocity resets
                                     -- (lower = peak speed stays manageable;
@@ -104,11 +104,16 @@ local ListeningForBind = nil   -- "hitbox" / "autokill" while picking a key
 --                immediately after sending.
 local Stats = { TitansKilled = 0, RunKills = 0 }
 
--- Discord webhook. Default is hardcoded for quick testing; the
--- on-disk file at c:\matcha\workspace\AOTR\webhook.txt overrides
--- it if non-empty. Empty / missing file → keeps the default.
-local WEBHOOK_URL  = "https://discord.com/api/webhooks/1498885994923954227/8g3_F1lwASSc6p0vREh43wiABisuzh8RpNYVK2vBa9PdZnMCGo4kwWWkwgDLHZDgzZD2"
-local WEBHOOK_PATH = "AOTR/webhook.txt"
+-- Discord webhook URL. Set by assigning the global `Webhook_URL`
+-- BEFORE this script runs — the standard loadstring-injection
+-- pattern users are used to:
+--
+--   Webhook_URL = "https://discord.com/api/webhooks/..."
+--   loadstring(game:HttpGet("https://raw.githubusercontent.com/.../AOTR.lua"))()
+--
+-- Empty / missing / invalid → embeds silently no-op, everything
+-- else keeps working.
+local WEBHOOK_URL = ""
 
 -- Lifetime / persistent stats. Lives in its own file so it survives
 -- config corruption / format changes. Updated in-memory on each event
@@ -207,33 +212,16 @@ end
 
 -- ----- Discord webhook ---------------------------------------
 
+-- Pulls the URL from the `Webhook_URL` global the user sets above
+-- the loadstring call. Validates it looks like a real Discord
+-- webhook URL — anything else is dropped.
 local function loadWebhookUrl()
-    if type(readfile) ~= "function" or type(isfile) ~= "function" then return end
-    if not isfile(WEBHOOK_PATH) then return end
-    local ok, raw = pcall(readfile, WEBHOOK_PATH)
-    if not (ok and type(raw) == "string") then return end
-    local trimmed = raw:gsub("^[%s]+", ""):gsub("[%s]+$", "")
-    -- Validate it looks like a Discord webhook URL. The typing-in-
-    -- field pattern can capture stray keystrokes (Matcha's
-    -- iskeypressed is global, not window-focused), so we've seen
-    -- garbage end up on disk. Ignore anything that isn't a real URL.
+    if type(Webhook_URL) ~= "string" then return end
+    local trimmed = Webhook_URL:gsub("^[%s]+", ""):gsub("[%s]+$", "")
     if trimmed:match("^https://discord%.com/api/webhooks/") or
        trimmed:match("^https://discordapp%.com/api/webhooks/") then
         WEBHOOK_URL = trimmed
     end
-end
-
-local function saveWebhookUrl()
-    if type(writefile) ~= "function" then return end
-    task.spawn(function()
-        pcall(function()
-            if type(makefolder) == "function" and type(isfolder) == "function"
-               and not isfolder(CONFIG_DIR) then
-                makefolder(CONFIG_DIR)
-            end
-            writefile(WEBHOOK_PATH, WEBHOOK_URL or "")
-        end)
-    end)
 end
 
 -- POSTs a JSON-encoded payload to the webhook. Matcha exposes
@@ -857,10 +845,6 @@ GUI.ActiveSlider     = nil
 GUI.EditingSlider    = nil
 GUI.SliderBuffer     = ""
 GUI.SliderKeyState   = {}
-GUI.EditingWebhook   = false
-GUI.WebhookBuffer    = ""
-GUI.WebhookKeyState  = {}
-GUI.WebhookLabelRef  = nil
 GUI.ContentGen       = 0
 GUI.AnimToken        = 0
 -- Live-stat element refs (populated per-page)
@@ -1089,7 +1073,6 @@ ClearContent = function()
     GUI.LifeGoldVal     = nil
     GUI.LifeRetriesVal  = nil
     GUI.LifeUptimeVal   = nil
-    GUI.WebhookLabelRef = nil
 end
 
 local function DrawCard(x, y, w, h, title, zbase)
@@ -1840,109 +1823,6 @@ local function PageSettings(zb, cardX, cardW)
             end
         end, 6)
 
-    -- Webhook card.
-    --   URL field : click to enter text-input mode. Type or Ctrl+V
-    --               paste the URL via OS keystrokes (Matcha can't
-    --               read the clipboard directly). Enter saves to
-    --               disk; Esc cancels.
-    --   Test      : fires a small embed at the current URL.
-    --   Clear     : empties the URL state and the on-disk file.
-    local whTopY = configTopY + configH + 14
-    local whH    = 52 + 28 + 32 + 14
-    local whY    = DrawCard(cardX2, whTopY, cardW2, whH, "Webhook", zb)
-
-    -- Clickable URL field. Truncates from the left when not editing
-    -- so the visually-meaningful tail (the token / channel id) stays
-    -- on screen instead of "https://discord..." filling the box.
-    local fieldX = lx
-    local fieldW = cardW2 - 2 * Config.CardPad
-    local fieldH = 24
-    local fieldY = whY + 4
-
-    local fieldBg = Drawing.new("Square")
-    fieldBg.Position = Vector2.new(fieldX, fieldY)
-    fieldBg.Size = Vector2.new(fieldW, fieldH)
-    fieldBg.Color = Colors.ToggleOff; fieldBg.Filled = true; fieldBg.Corner = 4
-    fieldBg.Visible = true; fieldBg.ZIndex = zb + 4
-    table.insert(GUI.ContentElements, fieldBg)
-
-    local fieldBorder = Drawing.new("Square")
-    fieldBorder.Position = Vector2.new(fieldX, fieldY)
-    fieldBorder.Size = Vector2.new(fieldW, fieldH)
-    fieldBorder.Color = GUI.EditingWebhook and Colors.AccentRed or Colors.CardBorder
-    fieldBorder.Filled = false; fieldBorder.Corner = 4; fieldBorder.Thickness = 1
-    fieldBorder.Visible = true; fieldBorder.ZIndex = zb + 5
-    table.insert(GUI.ContentElements, fieldBorder)
-
-    local maxChars = math.floor((fieldW - 12) / 7)  -- ~7px per char at size 13
-    local rawText, txtCol
-    if GUI.EditingWebhook then
-        rawText = GUI.WebhookBuffer .. "_"
-        txtCol  = Colors.AccentRed
-    elseif WEBHOOK_URL ~= "" then
-        rawText = WEBHOOK_URL
-        txtCol  = Colors.TextPrimary
-    else
-        rawText = "Click to enter URL"
-        txtCol  = Colors.TextMuted
-    end
-    local shown = rawText
-    if #shown > maxChars then
-        shown = "…" .. string.sub(shown, #shown - maxChars + 2)
-    end
-
-    local urlLbl = Drawing.new("Text")
-    urlLbl.Position = Vector2.new(fieldX + 6, fieldY + 5)
-    urlLbl.Text = shown
-    urlLbl.Color = txtCol
-    urlLbl.Size = 13; urlLbl.Font = Drawing.Fonts.System
-    urlLbl.Center = false; urlLbl.Outline = false
-    urlLbl.Visible = true; urlLbl.ZIndex = zb + 6
-    table.insert(GUI.ContentElements, urlLbl)
-    GUI.WebhookLabelRef = urlLbl
-
-    table.insert(GUI.Clickables, {
-        x = fieldX, y = fieldY, w = fieldW, h = fieldH,
-        hover = { el = fieldBorder, base = fieldBorder.Color },
-        onClick = function()
-            if GUI.EditingWebhook then return end
-            GUI.EditingWebhook  = true
-            GUI.WebhookBuffer   = WEBHOOK_URL or ""
-            GUI.WebhookKeyState = {}
-            notify("Type/paste URL. Enter to save, Esc to cancel.", "AOT:R", 4)
-            CreateContent()
-        end,
-    })
-
-    local wBtnGap = 8
-    local wBtnH   = 26
-    local wInner  = cardW2 - 2 * Config.CardPad
-    local wBtnW   = (wInner - wBtnGap) / 2
-    local wBtnY   = fieldY + fieldH + 8
-
-    DrawSmallButton(lx, wBtnY, wBtnW, wBtnH, "Test",
-        Colors.AccentRed, zb, function()
-            if WEBHOOK_URL == "" then
-                notify("No webhook URL set", "AOT:R", 2)
-                return
-            end
-            sendWebhookRaw(buildEmbed("🧪 Webhook Test", EMBED_GOOD, {
-                { "Player",  getPlayerName(),                  true },
-                { "Message", "If you see this, it's working.", false },
-            }))
-            notify("Test embed sent", "AOT:R", 2)
-        end, 6)
-
-    DrawSmallButton(lx + wBtnW + wBtnGap, wBtnY, wBtnW, wBtnH, "Clear",
-        Colors.StatusOff, zb, function()
-            WEBHOOK_URL = ""
-            saveWebhookUrl()
-            GUI.EditingWebhook  = false
-            GUI.WebhookBuffer   = ""
-            GUI.WebhookKeyState = {}
-            notify("Webhook cleared", "AOT:R", 2)
-            CreateContent()
-        end, 6)
 end
 
 CreateContent = function()
@@ -3001,26 +2881,6 @@ local function sliderRising(vk)
     return down and not was
 end
 
-local function webhookRising(vk)
-    local down = iskeypressed(vk)
-    local was  = GUI.WebhookKeyState[vk]
-    GUI.WebhookKeyState[vk] = down
-    return down and not was
-end
-
--- VK -> { unshifted_char, shifted_char }. We only handle keys that
--- can legitimately appear in a Discord webhook URL: letters, digits,
--- `:`, `/`, `.`, `-`, `_`. Shift state is read live from VK_SHIFT.
-local WebhookKeyMap = {
-    [0xBA] = { ";",  ":" },   -- VK_OEM_1
-    [0xBF] = { "/",  "?" },   -- VK_OEM_2
-    [0xBE] = { ".",  ">" },   -- VK_OEM_PERIOD
-    [0xBD] = { "-",  "_" },   -- VK_OEM_MINUS
-    [0x6E] = { ".",  "."  },  -- numpad decimal
-    [0x6F] = { "/",  "/"  },  -- numpad divide
-    [0x6D] = { "-",  "-"  },  -- numpad subtract
-}
-
 local function InputLoop()
     while GUI.Running do
         repeat
@@ -3068,124 +2928,6 @@ local function InputLoop()
                     GUI.EditingSlider.valTxt.Text = GUI.SliderBuffer .. "_"
                 end)
             end
-            if GUI.Visible then
-                local mx, my = Mouse.X, Mouse.Y
-                local mouseDown = ismouse1pressed()
-                local justPressed = mouseDown and not GUI.WasMouseDown
-                if justPressed then
-                    for _, c in ipairs(GUI.Clickables) do
-                        if IsInside(mx, my, c.x, c.y, c.w, c.h) then
-                            if c.hover and c.hover.el then pressEffect(c.hover.el) end
-                            c.onClick()
-                            break
-                        end
-                    end
-                end
-                GUI.WasMouseDown = mouseDown
-            else
-                GUI.WasMouseDown = false
-            end
-            break
-        end
-
-        -- Webhook URL text-input mode. Captures direct keystrokes
-        -- only (Matcha exposes no clipboard read, and Ctrl+V paste
-        -- delivers WM_CHAR rather than physical key state — so the
-        -- user types the URL out manually). Gated on isrbxactive()
-        -- so we don't steal keystrokes the user is typing into chat,
-        -- the IDE, etc. — iskeypressed reads global keyboard state.
-        if GUI.EditingWebhook then
-            local rbxFocused = true
-            if type(isrbxactive) == "function" then
-                local ok, v = pcall(isrbxactive)
-                if ok then rbxFocused = v and true or false end
-            end
-            if not rbxFocused then
-                -- Just pump the rising-edge state so we don't burst
-                -- when focus returns. No buffer mutation.
-                for vk in pairs(GUI.WebhookKeyState) do
-                    GUI.WebhookKeyState[vk] = iskeypressed(vk)
-                end
-                break
-            end
-            local bufChanged = false
-            local shift = iskeypressed(0x10) or iskeypressed(0xA0) or iskeypressed(0xA1)
-
-            -- Letters (A..Z) — case follows shift.
-            for vk = 0x41, 0x5A do
-                if webhookRising(vk) then
-                    local ch = string.char(vk)
-                    if not shift then ch = string.lower(ch) end
-                    GUI.WebhookBuffer = GUI.WebhookBuffer .. ch
-                    bufChanged = true
-                end
-            end
-
-            -- Top-row digits (shifted symbols ignored — URLs don't
-            -- need them).
-            for vk = 0x30, 0x39 do
-                if webhookRising(vk) and not shift then
-                    GUI.WebhookBuffer = GUI.WebhookBuffer .. string.char(vk)
-                    bufChanged = true
-                end
-            end
-
-            -- Numpad digits.
-            for vk = 0x60, 0x69 do
-                if webhookRising(vk) then
-                    GUI.WebhookBuffer = GUI.WebhookBuffer .. string.char(vk - 0x60 + 0x30)
-                    bufChanged = true
-                end
-            end
-
-            -- Punctuation that appears in webhook URLs.
-            for vk, pair in pairs(WebhookKeyMap) do
-                if webhookRising(vk) then
-                    GUI.WebhookBuffer = GUI.WebhookBuffer .. (shift and pair[2] or pair[1])
-                    bufChanged = true
-                end
-            end
-
-            if webhookRising(0x08) then  -- Backspace
-                GUI.WebhookBuffer = string.sub(GUI.WebhookBuffer, 1, -2)
-                bufChanged = true
-            end
-
-            if webhookRising(0x0D) then  -- Enter — save
-                local trimmed = GUI.WebhookBuffer
-                    :gsub("^[%s]+", ""):gsub("[%s]+$", "")
-                WEBHOOK_URL = trimmed
-                saveWebhookUrl()
-                GUI.EditingWebhook  = false
-                GUI.WebhookBuffer   = ""
-                GUI.WebhookKeyState = {}
-                if WEBHOOK_URL ~= "" then
-                    notify("Webhook saved", "AOT:R", 2)
-                else
-                    notify("Webhook cleared", "AOT:R", 2)
-                end
-                if GUI.Visible and not GUI.Minimized then CreateContent() end
-            end
-
-            if GUI.EditingWebhook and webhookRising(0x1B) then  -- Esc — cancel
-                GUI.EditingWebhook  = false
-                GUI.WebhookBuffer   = ""
-                GUI.WebhookKeyState = {}
-                if GUI.Visible and not GUI.Minimized then CreateContent() end
-            end
-
-            if bufChanged and GUI.WebhookLabelRef then
-                pcall(function()
-                    local raw = GUI.WebhookBuffer .. "_"
-                    local maxChars = 48
-                    local shown = raw
-                    if #shown > maxChars then
-                        shown = "…" .. string.sub(shown, #shown - maxChars + 2)
-                    end
-                    GUI.WebhookLabelRef.Text = shown
-                end)
-            end
-
             if GUI.Visible then
                 local mx, my = Mouse.X, Mouse.Y
                 local mouseDown = ismouse1pressed()
